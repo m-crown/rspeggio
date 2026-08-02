@@ -28,6 +28,14 @@ clippy-ci:
 test:
     cargo test
 
+# run local build
+build:
+    cargo build
+
+# run release build
+build-release:
+    cargo build --release
+
 #runs full local dev check
 check: fmt clippy test
 
