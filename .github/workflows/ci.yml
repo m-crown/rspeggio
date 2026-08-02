@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: extractions/setup-just@v2
+
+      - run: just ci
+
+      # TODO: golden fixtures (tests/fixtures/golden/) are currently committed
+      # as static files and trusted as-is. If we want CI to guarantee they're
+      # still in sync with the real pdbe-arpeggio oracle (rather than just
+      # trusting the last time someone ran generate_fixtures.py locally),
+      # add a separate job here that:
+      #   - sets up Python + the oracle_env deps (gemmi, biopython, openbabel-wheel)
+      #   - pip installs pdbe-arpeggio from the vendored ~/GitHub/arpeggio clone
+      #     (or a pinned copy/submodule of it, since this workflow can't see
+      #     paths outside this repo)
+      #   - reruns tests/tools/generate_fixtures.py
+      #   - fails the build if the regenerated JSON differs from the committed copy
+      # Deferred for now: adds a second language toolchain + network fetch of
+      # PDB structures to every CI run, for a check that only matters when the
+      # oracle itself changes (i.e. arpeggio is updated), which is rare.
