@@ -26,6 +26,47 @@ fn parse_loop_headers(lines: &[&str], category: &str) -> HashMap<String, usize> 
     headers
 }
 
+// The header lines and data lines belonging to one `loop_` block, so a
+// caller can hand `headers` straight to `parse_loop_headers` and iterate
+// `data` for row parsing without re-scanning the file to find either half.
+struct LoopBlock<'a> {
+    headers: &'a [&'a str],
+    data: &'a [&'a str],
+}
+
+// Scans a CIF file's lines for the `loop_` block whose headers start with
+// `_{category}.`, returning `None` if that category isn't present at all
+// (some CCD entries omit e.g. a bond loop).
+fn find_loop_block<'a>(lines: &'a [&'a str], category: &str) -> Option<LoopBlock<'a>> {
+    let prefix = format!("_{category}.");
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].trim() == "loop_" {
+            let header_start = i + 1;
+            if header_start < lines.len() && lines[header_start].trim().starts_with(&prefix) {
+                let mut header_end = header_start;
+                while header_end < lines.len() && lines[header_end].trim().starts_with(&prefix) {
+                    header_end += 1;
+                }
+                let mut data_end = header_end;
+                while data_end < lines.len() {
+                    let t = lines[data_end].trim();
+                    if t.is_empty() || t == "#" || t == "loop_" || t.starts_with('_') {
+                        break;
+                    }
+                    data_end += 1;
+                }
+                return Some(LoopBlock {
+                    headers: &lines[header_start..header_end],
+                    data: &lines[header_end..data_end],
+                });
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 // TODO: in the future this could be zero-copy borrowed return <Vec &str> but for now will copy
 // TODO: revisit this as an iterator-based walk (chars.iter().peekable(), .next()/.peek())
 // instead of manual index bookkeeping, once quote-handling (step 3) is done and this is
@@ -162,6 +203,49 @@ mod tests {
     fn empty_header_lines_yield_empty_map() {
         let lines: [&str; 0] = [];
         assert!(parse_loop_headers(&lines, "chem_comp_atom").is_empty());
+    }
+
+    #[test]
+    fn finds_the_atom_loop_block_in_a_real_ccd_file() {
+        let contents = load_ccd_file("tests/fixtures/ADP_ideal.cif").expect("fixture should load");
+        let lines: Vec<&str> = contents.lines().collect();
+
+        let block = find_loop_block(&lines, "chem_comp_atom").expect("atom loop should be found");
+
+        assert_eq!(block.headers.len(), 21);
+        assert_eq!(block.headers[0].trim(), "_chem_comp_atom.comp_id");
+        assert_eq!(block.headers[20].trim(), "_chem_comp_atom.pdbx_ordinal");
+
+        assert_eq!(block.data.len(), 42);
+        assert!(block.data[0].trim_start().starts_with("ADP PB"));
+        assert!(block
+            .data
+            .last()
+            .unwrap()
+            .trim_start()
+            .starts_with("ADP H2"));
+    }
+
+    #[test]
+    fn finds_the_bond_loop_block_in_a_real_ccd_file() {
+        let contents = load_ccd_file("tests/fixtures/ADP_ideal.cif").expect("fixture should load");
+        let lines: Vec<&str> = contents.lines().collect();
+
+        let block = find_loop_block(&lines, "chem_comp_bond").expect("bond loop should be found");
+
+        assert_eq!(block.headers.len(), 7);
+        assert_eq!(block.data.len(), 44);
+        // atom and bond data slices must not overlap
+        let atom_block = find_loop_block(&lines, "chem_comp_atom").unwrap();
+        assert!(atom_block.data.last().unwrap() != block.data.first().unwrap());
+    }
+
+    #[test]
+    fn missing_category_returns_none() {
+        let contents = load_ccd_file("tests/fixtures/ADP_ideal.cif").expect("fixture should load");
+        let lines: Vec<&str> = contents.lines().collect();
+
+        assert!(find_loop_block(&lines, "chem_comp_nonexistent").is_none());
     }
 
     #[test]
