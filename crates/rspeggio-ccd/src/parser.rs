@@ -5,9 +5,25 @@
 #![allow(unused_imports)]
 
 use crate::component::{CcdAtom, CcdComponent};
+use std::collections::HashMap;
 
 fn load_ccd_file(path: &str) -> Result<String, std::io::Error> {
     std::fs::read_to_string(path)
+}
+
+// Maps each `_{category}.field_name` header line to its zero-based column
+// index, so row-parsing can look fields up by name instead of position.
+// The CCD schema drifts across remediation eras (extra/missing/reordered
+// fields between entries), so column position alone can't be trusted.
+fn parse_loop_headers(lines: &[&str], category: &str) -> HashMap<String, usize> {
+    let prefix = format!("_{category}.");
+    let mut headers = HashMap::new();
+    for (i, line) in lines.iter().enumerate() {
+        if let Some(field) = line.trim().strip_prefix(&prefix) {
+            headers.insert(field.to_string(), i);
+        }
+    }
+    headers
 }
 
 // TODO: in the future this could be zero-copy borrowed return <Vec &str> but for now will copy
@@ -82,6 +98,70 @@ mod tests {
             tokens,
             vec!["ALA", "N", "N", "N", "0", "1", "N", "N", "N", "N", "N", "N"]
         );
+    }
+
+    #[test]
+    fn maps_atom_header_fields_to_column_indices() {
+        let lines = [
+            "_chem_comp_atom.comp_id ",
+            "_chem_comp_atom.atom_id ",
+            "_chem_comp_atom.alt_atom_id ",
+            "_chem_comp_atom.type_symbol ",
+            "_chem_comp_atom.charge ",
+            "_chem_comp_atom.pdbx_align ",
+            "_chem_comp_atom.pdbx_aromatic_flag ",
+            "_chem_comp_atom.pdbx_leaving_atom_flag ",
+            "_chem_comp_atom.pdbx_stereo_config ",
+            "_chem_comp_atom.pdbx_backbone_atom_flag ",
+            "_chem_comp_atom.pdbx_n_terminal_atom_flag ",
+            "_chem_comp_atom.pdbx_c_terminal_atom_flag ",
+            "_chem_comp_atom.model_Cartn_x ",
+            "_chem_comp_atom.model_Cartn_y ",
+            "_chem_comp_atom.model_Cartn_z ",
+            "_chem_comp_atom.pdbx_model_Cartn_x_ideal ",
+            "_chem_comp_atom.pdbx_model_Cartn_y_ideal ",
+            "_chem_comp_atom.pdbx_model_Cartn_z_ideal ",
+            "_chem_comp_atom.pdbx_component_atom_id ",
+            "_chem_comp_atom.pdbx_component_comp_id ",
+            "_chem_comp_atom.pdbx_ordinal ",
+        ];
+
+        let headers = parse_loop_headers(&lines, "chem_comp_atom");
+
+        assert_eq!(headers.len(), lines.len());
+        assert_eq!(headers.get("comp_id"), Some(&0));
+        assert_eq!(headers.get("atom_id"), Some(&1));
+        assert_eq!(headers.get("type_symbol"), Some(&3));
+        assert_eq!(headers.get("pdbx_aromatic_flag"), Some(&6));
+        assert_eq!(headers.get("pdbx_ordinal"), Some(&20));
+    }
+
+    #[test]
+    fn header_parsing_is_reusable_across_loop_categories() {
+        let lines = [
+            "_chem_comp_bond.comp_id ",
+            "_chem_comp_bond.atom_id_1 ",
+            "_chem_comp_bond.atom_id_2 ",
+            "_chem_comp_bond.value_order ",
+            "_chem_comp_bond.pdbx_aromatic_flag ",
+            "_chem_comp_bond.pdbx_stereo_config ",
+            "_chem_comp_bond.pdbx_ordinal ",
+        ];
+
+        let headers = parse_loop_headers(&lines, "chem_comp_bond");
+
+        assert_eq!(headers.len(), 7);
+        assert_eq!(headers.get("atom_id_1"), Some(&1));
+        assert_eq!(headers.get("atom_id_2"), Some(&2));
+        assert_eq!(headers.get("pdbx_ordinal"), Some(&6));
+        // fields belonging to a different category are never present
+        assert_eq!(headers.get("type_symbol"), None);
+    }
+
+    #[test]
+    fn empty_header_lines_yield_empty_map() {
+        let lines: [&str; 0] = [];
+        assert!(parse_loop_headers(&lines, "chem_comp_atom").is_empty());
     }
 
     #[test]
