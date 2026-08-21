@@ -18,6 +18,49 @@ impl CcdAtom {
     }
 }
 
+#[derive(Debug, PartialEq)]
+pub enum BondOrder {
+    Single,
+    Double,
+    Triple,
+    Aromatic,
+}
+
+impl BondOrder {
+    // Maps the raw `value_order` token (`SING`/`DOUB`/`TRIP`/`AROM`) from a
+    // `_chem_comp_bond` row. `None` for anything else, so an unrecognized
+    // value fails the row rather than silently defaulting to some order.
+    pub fn from_ccd_str(s: &str) -> Option<Self> {
+        match s {
+            "SING" => Some(Self::Single),
+            "DOUB" => Some(Self::Double),
+            "TRIP" => Some(Self::Triple),
+            "AROM" => Some(Self::Aromatic),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub struct CcdBond {
+    pub(crate) atom_id_1: String,
+    pub(crate) atom_id_2: String,
+    pub(crate) order: BondOrder,
+    pub(crate) aromatic: bool,
+}
+
+impl CcdBond {
+    pub fn new(atom_id_1: String, atom_id_2: String, order: BondOrder, aromatic: bool) -> Self {
+        Self {
+            atom_id_1,
+            atom_id_2,
+            order,
+            aromatic,
+        }
+    }
+}
+
 pub struct CcdComponent {
     atoms: Vec<CcdAtom>,
+    bonds: Vec<CcdBond>,
 }

@@ -4,7 +4,7 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
 
-use crate::component::{CcdAtom, CcdComponent};
+use crate::component::{BondOrder, CcdAtom, CcdBond, CcdComponent};
 use std::collections::HashMap;
 
 fn load_ccd_file(path: &str) -> Result<String, std::io::Error> {
@@ -84,6 +84,28 @@ fn build_atoms(headers: &HashMap<String, usize>, data: &[&str]) -> Option<Vec<Cc
             let element = tokens.get(element_idx)?.clone();
             let aromatic = tokens.get(aromatic_idx)?.as_str() == "Y";
             Some(CcdAtom::new(atom_id, element, aromatic))
+        })
+        .collect()
+}
+
+// Builds `CcdBond`s from a `_chem_comp_bond` loop's header map and data
+// rows. Same failure posture as `build_atoms`: a missing required header,
+// a short row, or an unrecognized `value_order` token all yield `None`
+// rather than a guessed bond.
+fn build_bonds(headers: &HashMap<String, usize>, data: &[&str]) -> Option<Vec<CcdBond>> {
+    let atom_1_idx = *headers.get("atom_id_1")?;
+    let atom_2_idx = *headers.get("atom_id_2")?;
+    let order_idx = *headers.get("value_order")?;
+    let aromatic_idx = *headers.get("pdbx_aromatic_flag")?;
+
+    data.iter()
+        .map(|line| {
+            let tokens = tokenize_cif_row(line);
+            let atom_id_1 = tokens.get(atom_1_idx)?.clone();
+            let atom_id_2 = tokens.get(atom_2_idx)?.clone();
+            let order = BondOrder::from_ccd_str(tokens.get(order_idx)?)?;
+            let aromatic = tokens.get(aromatic_idx)?.as_str() == "Y";
+            Some(CcdBond::new(atom_id_1, atom_id_2, order, aromatic))
         })
         .collect()
 }
@@ -310,6 +332,67 @@ mod tests {
 
         // only two tokens, but pdbx_aromatic_flag is expected at index 2
         assert!(build_atoms(&headers, &["PB P"]).is_none());
+    }
+
+    #[test]
+    fn builds_bonds_from_the_real_ccd_fixture() {
+        let contents = load_ccd_file("tests/fixtures/ADP_ideal.cif").expect("fixture should load");
+        let lines: Vec<&str> = contents.lines().collect();
+        let block = find_loop_block(&lines, "chem_comp_bond").expect("bond loop should be found");
+        let headers = parse_loop_headers(block.headers, "chem_comp_bond");
+
+        let bonds = build_bonds(&headers, block.data).expect("bonds should build");
+
+        assert_eq!(bonds.len(), 44);
+        assert_eq!(
+            bonds[0],
+            CcdBond::new(
+                "PB".to_string(),
+                "O1B".to_string(),
+                BondOrder::Double,
+                false
+            )
+        );
+        assert_eq!(
+            bonds[1],
+            CcdBond::new(
+                "PB".to_string(),
+                "O2B".to_string(),
+                BondOrder::Single,
+                false
+            )
+        );
+    }
+
+    #[test]
+    fn build_bonds_fails_when_a_required_header_is_missing() {
+        let mut headers = HashMap::new();
+        headers.insert("atom_id_1".to_string(), 0);
+        headers.insert("atom_id_2".to_string(), 1);
+        // "value_order" deliberately absent
+        headers.insert("pdbx_aromatic_flag".to_string(), 3);
+
+        assert!(build_bonds(&headers, &["PB O1B DOUB N"]).is_none());
+    }
+
+    #[test]
+    fn build_bonds_fails_on_an_unrecognized_value_order() {
+        let mut headers = HashMap::new();
+        headers.insert("atom_id_1".to_string(), 0);
+        headers.insert("atom_id_2".to_string(), 1);
+        headers.insert("value_order".to_string(), 2);
+        headers.insert("pdbx_aromatic_flag".to_string(), 3);
+
+        assert!(build_bonds(&headers, &["PB O1B QUAD N"]).is_none());
+    }
+
+    #[test]
+    fn bond_order_recognizes_all_four_ccd_values() {
+        assert_eq!(BondOrder::from_ccd_str("SING"), Some(BondOrder::Single));
+        assert_eq!(BondOrder::from_ccd_str("DOUB"), Some(BondOrder::Double));
+        assert_eq!(BondOrder::from_ccd_str("TRIP"), Some(BondOrder::Triple));
+        assert_eq!(BondOrder::from_ccd_str("AROM"), Some(BondOrder::Aromatic));
+        assert_eq!(BondOrder::from_ccd_str("QUAD"), None);
     }
 
     #[test]
