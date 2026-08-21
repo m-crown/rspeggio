@@ -67,6 +67,27 @@ fn find_loop_block<'a>(lines: &'a [&'a str], category: &str) -> Option<LoopBlock
     None
 }
 
+// Builds `CcdAtom`s from a `_chem_comp_atom` loop's header map and data
+// rows. Returns `None` if a required field is missing from the header map,
+// or if any data row is short a token for one of those fields — CCD schema
+// drift is expected across categories/eras, but a malformed atom row within
+// a category we *did* find is a real problem, not something to paper over.
+fn build_atoms(headers: &HashMap<String, usize>, data: &[&str]) -> Option<Vec<CcdAtom>> {
+    let atom_id_idx = *headers.get("atom_id")?;
+    let element_idx = *headers.get("type_symbol")?;
+    let aromatic_idx = *headers.get("pdbx_aromatic_flag")?;
+
+    data.iter()
+        .map(|line| {
+            let tokens = tokenize_cif_row(line);
+            let atom_id = tokens.get(atom_id_idx)?.clone();
+            let element = tokens.get(element_idx)?.clone();
+            let aromatic = tokens.get(aromatic_idx)?.as_str() == "Y";
+            Some(CcdAtom::new(atom_id, element, aromatic))
+        })
+        .collect()
+}
+
 // TODO: in the future this could be zero-copy borrowed return <Vec &str> but for now will copy
 // TODO: revisit this as an iterator-based walk (chars.iter().peekable(), .next()/.peek())
 // instead of manual index bookkeeping, once quote-handling (step 3) is done and this is
@@ -246,6 +267,49 @@ mod tests {
         let lines: Vec<&str> = contents.lines().collect();
 
         assert!(find_loop_block(&lines, "chem_comp_nonexistent").is_none());
+    }
+
+    #[test]
+    fn builds_atoms_from_the_real_ccd_fixture() {
+        let contents = load_ccd_file("tests/fixtures/ADP_ideal.cif").expect("fixture should load");
+        let lines: Vec<&str> = contents.lines().collect();
+        let block = find_loop_block(&lines, "chem_comp_atom").expect("atom loop should be found");
+        let headers = parse_loop_headers(block.headers, "chem_comp_atom");
+
+        let atoms = build_atoms(&headers, block.data).expect("atoms should build");
+
+        assert_eq!(atoms.len(), 42);
+        assert_eq!(
+            atoms[0],
+            CcdAtom::new("PB".to_string(), "P".to_string(), false)
+        );
+        let n9 = atoms
+            .iter()
+            .find(|a| a.atom_id == "N9")
+            .expect("N9 atom should be present");
+        assert_eq!(n9.element, "N");
+        assert!(n9.aromatic, "N9 is part of the purine ring, flagged Y");
+    }
+
+    #[test]
+    fn build_atoms_fails_when_a_required_header_is_missing() {
+        let mut headers = HashMap::new();
+        headers.insert("atom_id".to_string(), 0);
+        // "type_symbol" deliberately absent
+        headers.insert("pdbx_aromatic_flag".to_string(), 2);
+
+        assert!(build_atoms(&headers, &["PB P N"]).is_none());
+    }
+
+    #[test]
+    fn build_atoms_fails_on_a_short_data_row() {
+        let mut headers = HashMap::new();
+        headers.insert("atom_id".to_string(), 0);
+        headers.insert("type_symbol".to_string(), 1);
+        headers.insert("pdbx_aromatic_flag".to_string(), 2);
+
+        // only two tokens, but pdbx_aromatic_flag is expected at index 2
+        assert!(build_atoms(&headers, &["PB P"]).is_none());
     }
 
     #[test]
