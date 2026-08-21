@@ -1,6 +1,3 @@
-// temporary remove once used downstream
-#![allow(dead_code)]
-
 #[derive(Debug, PartialEq)]
 pub struct CcdAtom {
     pub(crate) atom_id: String,
@@ -63,4 +60,18 @@ impl CcdBond {
 pub struct CcdComponent {
     atoms: Vec<CcdAtom>,
     bonds: Vec<CcdBond>,
+}
+
+impl CcdComponent {
+    pub fn new(atoms: Vec<CcdAtom>, bonds: Vec<CcdBond>) -> Self {
+        Self { atoms, bonds }
+    }
+
+    pub fn atoms(&self) -> &[CcdAtom] {
+        &self.atoms
+    }
+
+    pub fn bonds(&self) -> &[CcdBond] {
+        &self.bonds
+    }
 }

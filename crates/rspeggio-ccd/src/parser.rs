@@ -1,14 +1,44 @@
 // crates/rspeggio-ccd/src/parser.rs
-// TODO: remove once load_ccd_file/tokenize_cif_row are called from real (non-test) code,
-// and CcdAtom/CcdComponent are actually constructed here.
-#![allow(dead_code)]
-#![allow(unused_imports)]
 
 use crate::component::{BondOrder, CcdAtom, CcdBond, CcdComponent};
 use std::collections::HashMap;
 
 fn load_ccd_file(path: &str) -> Result<String, std::io::Error> {
     std::fs::read_to_string(path)
+}
+
+// Parses a full CCD mmCIF file's contents into a `CcdComponent`. The atom
+// loop is required — every component has atoms — so its absence or any
+// malformed atom row fails the whole parse. The bond loop is optional:
+// single-atom components (e.g. metal ions like Zn2+) legitimately have no
+// `_chem_comp_bond` block at all, which means zero bonds, not a parse
+// failure. A malformed bond *row* within a bond loop that does exist is
+// still a hard failure, same as for atoms.
+pub fn parse_ccd_component(contents: &str) -> Option<CcdComponent> {
+    let lines: Vec<&str> = contents.lines().collect();
+
+    let atom_block = find_loop_block(&lines, "chem_comp_atom")?;
+    let atom_headers = parse_loop_headers(&atom_block.header_refs(), "chem_comp_atom");
+    let atoms = build_atoms(&atom_headers, &atom_block.data_refs())?;
+
+    let bonds = match find_loop_block(&lines, "chem_comp_bond") {
+        Some(bond_block) => {
+            let bond_headers = parse_loop_headers(&bond_block.header_refs(), "chem_comp_bond");
+            build_bonds(&bond_headers, &bond_block.data_refs())?
+        }
+        None => Vec::new(),
+    };
+
+    Some(CcdComponent::new(atoms, bonds))
+}
+
+// Loads and parses a CCD mmCIF file from disk in one step. `None` covers
+// both an unreadable file and a file that doesn't parse as a valid
+// component -- callers needing to distinguish the two should call
+// `load_ccd_file`/`parse_ccd_component` directly instead.
+pub fn load_ccd_component(path: &str) -> Option<CcdComponent> {
+    let contents = load_ccd_file(path).ok()?;
+    parse_ccd_component(&contents)
 }
 
 // Maps each `_{category}.field_name` header line to its zero-based column
@@ -26,26 +56,47 @@ fn parse_loop_headers(lines: &[&str], category: &str) -> HashMap<String, usize> 
     headers
 }
 
-// The header lines and data lines belonging to one `loop_` block, so a
+// The header lines and data lines belonging to one category's block, so a
 // caller can hand `headers` straight to `parse_loop_headers` and iterate
 // `data` for row parsing without re-scanning the file to find either half.
-struct LoopBlock<'a> {
-    headers: &'a [&'a str],
-    data: &'a [&'a str],
+// Owned rather than borrowed: the scalar-row fallback below has to
+// synthesize its single data row from several separate lines, so it can't
+// stay a zero-copy slice of the original file the way a real `loop_` block
+// can.
+struct LoopBlock {
+    headers: Vec<String>,
+    data: Vec<String>,
 }
 
-// Scans a CIF file's lines for the `loop_` block whose headers start with
-// `_{category}.`, returning `None` if that category isn't present at all
-// (some CCD entries omit e.g. a bond loop).
-fn find_loop_block<'a>(lines: &'a [&'a str], category: &str) -> Option<LoopBlock<'a>> {
+impl LoopBlock {
+    fn header_refs(&self) -> Vec<&str> {
+        self.headers.iter().map(String::as_str).collect()
+    }
+
+    fn data_refs(&self) -> Vec<&str> {
+        self.data.iter().map(String::as_str).collect()
+    }
+}
+
+// Scans a CIF file's lines for the `_{category}.*` block, in either of
+// mmCIF's two valid forms: a `loop_` table (many rows), or scalar
+// `_{category}.field value` lines with no `loop_` at all (exactly one row —
+// e.g. every monatomic ion's `_chem_comp_atom` category, which has nothing
+// to bond and so also lacks any `_chem_comp_bond` block whatsoever).
+// Returns `None` if the category isn't present in either form.
+fn find_loop_block(lines: &[&str], category: &str) -> Option<LoopBlock> {
     let prefix = format!("_{category}.");
+    find_looped_block(lines, &prefix).or_else(|| find_scalar_block(lines, &prefix))
+}
+
+fn find_looped_block(lines: &[&str], prefix: &str) -> Option<LoopBlock> {
     let mut i = 0;
     while i < lines.len() {
         if lines[i].trim() == "loop_" {
             let header_start = i + 1;
-            if header_start < lines.len() && lines[header_start].trim().starts_with(&prefix) {
+            if header_start < lines.len() && lines[header_start].trim().starts_with(prefix) {
                 let mut header_end = header_start;
-                while header_end < lines.len() && lines[header_end].trim().starts_with(&prefix) {
+                while header_end < lines.len() && lines[header_end].trim().starts_with(prefix) {
                     header_end += 1;
                 }
                 let mut data_end = header_end;
@@ -57,14 +108,46 @@ fn find_loop_block<'a>(lines: &'a [&'a str], category: &str) -> Option<LoopBlock
                     data_end += 1;
                 }
                 return Some(LoopBlock {
-                    headers: &lines[header_start..header_end],
-                    data: &lines[header_end..data_end],
+                    headers: lines[header_start..header_end]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                    data: lines[header_end..data_end]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
                 });
             }
         }
         i += 1;
     }
     None
+}
+
+// Collects `_{category}.field value` lines and synthesizes them into one
+// data row, in the order the fields appeared, so the rest of the pipeline
+// (header map + tokenize-a-row) works identically regardless of which form
+// the file used.
+fn find_scalar_block(lines: &[&str], prefix: &str) -> Option<LoopBlock> {
+    let mut headers = Vec::new();
+    let mut values = Vec::new();
+    for line in lines {
+        let Some(rest) = line.trim().strip_prefix(prefix) else {
+            continue;
+        };
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        let field = parts.next()?;
+        let value = parts.next().unwrap_or("").trim();
+        headers.push(format!("{prefix}{field}"));
+        values.push(value.to_string());
+    }
+    if headers.is_empty() {
+        return None;
+    }
+    Some(LoopBlock {
+        headers,
+        data: vec![values.join(" ")],
+    })
 }
 
 // Builds `CcdAtom`s from a `_chem_comp_atom` loop's header map and data
@@ -296,9 +379,9 @@ mod tests {
         let contents = load_ccd_file("tests/fixtures/ADP_ideal.cif").expect("fixture should load");
         let lines: Vec<&str> = contents.lines().collect();
         let block = find_loop_block(&lines, "chem_comp_atom").expect("atom loop should be found");
-        let headers = parse_loop_headers(block.headers, "chem_comp_atom");
+        let headers = parse_loop_headers(&block.header_refs(), "chem_comp_atom");
 
-        let atoms = build_atoms(&headers, block.data).expect("atoms should build");
+        let atoms = build_atoms(&headers, &block.data_refs()).expect("atoms should build");
 
         assert_eq!(atoms.len(), 42);
         assert_eq!(
@@ -339,9 +422,9 @@ mod tests {
         let contents = load_ccd_file("tests/fixtures/ADP_ideal.cif").expect("fixture should load");
         let lines: Vec<&str> = contents.lines().collect();
         let block = find_loop_block(&lines, "chem_comp_bond").expect("bond loop should be found");
-        let headers = parse_loop_headers(block.headers, "chem_comp_bond");
+        let headers = parse_loop_headers(&block.header_refs(), "chem_comp_bond");
 
-        let bonds = build_bonds(&headers, block.data).expect("bonds should build");
+        let bonds = build_bonds(&headers, &block.data_refs()).expect("bonds should build");
 
         assert_eq!(bonds.len(), 44);
         assert_eq!(
@@ -365,13 +448,71 @@ mod tests {
     }
 
     #[test]
+    fn parses_a_full_component_from_a_real_ccd_file() {
+        let contents = load_ccd_file("tests/fixtures/ADP_ideal.cif").expect("fixture should load");
+
+        let component = parse_ccd_component(&contents).expect("ADP should parse");
+
+        assert_eq!(component.atoms().len(), 42);
+        assert_eq!(component.bonds().len(), 44);
+    }
+
+    #[test]
+    fn finds_a_scalar_form_atom_block_with_no_loop_keyword() {
+        let contents = load_ccd_file("tests/fixtures/ZN_ideal.cif").expect("fixture should load");
+        let lines: Vec<&str> = contents.lines().collect();
+
+        let block = find_loop_block(&lines, "chem_comp_atom")
+            .expect("scalar-form atom block should be found");
+
+        assert_eq!(
+            block.data.len(),
+            1,
+            "scalar form synthesizes exactly one row"
+        );
+        let headers = parse_loop_headers(&block.header_refs(), "chem_comp_atom");
+        let atoms = build_atoms(&headers, &block.data_refs()).expect("atom should build");
+
+        assert_eq!(atoms.len(), 1);
+        assert_eq!(atoms[0].atom_id, "ZN");
+        assert_eq!(atoms[0].element, "ZN");
+        assert!(!atoms[0].aromatic);
+    }
+
+    #[test]
+    fn loads_a_component_straight_from_a_file_path() {
+        let component =
+            load_ccd_component("tests/fixtures/ADP_ideal.cif").expect("ADP should load");
+
+        assert_eq!(component.atoms().len(), 42);
+        assert_eq!(component.bonds().len(), 44);
+    }
+
+    #[test]
+    fn load_ccd_component_returns_none_for_a_missing_file() {
+        assert!(load_ccd_component("tests/fixtures/does_not_exist.cif").is_none());
+    }
+
+    #[test]
+    fn parses_a_bondless_single_atom_component() {
+        let contents = load_ccd_file("tests/fixtures/ZN_ideal.cif").expect("fixture should load");
+
+        let component = parse_ccd_component(&contents).expect("ZN should parse");
+
+        assert_eq!(component.atoms().len(), 1);
+        assert_eq!(component.atoms()[0].atom_id, "ZN");
+        // no _chem_comp_bond loop at all for a bare ion -- zero bonds, not a failure
+        assert!(component.bonds().is_empty());
+    }
+
+    #[test]
     fn builds_a_real_triple_bond_from_the_cyanide_fixture() {
         let contents = load_ccd_file("tests/fixtures/CN_ideal.cif").expect("fixture should load");
         let lines: Vec<&str> = contents.lines().collect();
         let block = find_loop_block(&lines, "chem_comp_bond").expect("bond loop should be found");
-        let headers = parse_loop_headers(block.headers, "chem_comp_bond");
+        let headers = parse_loop_headers(&block.header_refs(), "chem_comp_bond");
 
-        let bonds = build_bonds(&headers, block.data).expect("bonds should build");
+        let bonds = build_bonds(&headers, &block.data_refs()).expect("bonds should build");
 
         assert_eq!(bonds.len(), 2);
         assert_eq!(
