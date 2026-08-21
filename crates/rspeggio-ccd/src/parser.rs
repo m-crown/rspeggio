@@ -365,6 +365,26 @@ mod tests {
     }
 
     #[test]
+    fn builds_a_real_triple_bond_from_the_cyanide_fixture() {
+        let contents = load_ccd_file("tests/fixtures/CN_ideal.cif").expect("fixture should load");
+        let lines: Vec<&str> = contents.lines().collect();
+        let block = find_loop_block(&lines, "chem_comp_bond").expect("bond loop should be found");
+        let headers = parse_loop_headers(block.headers, "chem_comp_bond");
+
+        let bonds = build_bonds(&headers, block.data).expect("bonds should build");
+
+        assert_eq!(bonds.len(), 2);
+        assert_eq!(
+            bonds[0],
+            CcdBond::new("C1".to_string(), "N1".to_string(), BondOrder::Triple, false)
+        );
+        assert_eq!(
+            bonds[1],
+            CcdBond::new("C1".to_string(), "H1".to_string(), BondOrder::Single, false)
+        );
+    }
+
+    #[test]
     fn build_bonds_fails_when_a_required_header_is_missing() {
         let mut headers = HashMap::new();
         headers.insert("atom_id_1".to_string(), 0);
