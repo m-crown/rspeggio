@@ -3,13 +3,19 @@
 
 use bitflags::bitflags;
 
-enum DistanceCategory {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DistanceCategory {
     Clash,
     Covalent,
     VdwClash,
     Vdw,
     Proximal,
 } // positions 0-4 in SIFt representation see pdbe-arpeggio `interactions.py:748-773`
+
+// Compensation factor added to the VdW-radii-sum upper bound before an
+// atom pair falls through to Proximal. Matches real pdbe-arpeggio's
+// default `vdw_comp` parameter (`interactions.py:37`).
+pub const VDW_COMP_FACTOR: f64 = 0.1;
 
 // u16 bit shift to build the FeatureBits e.g. HBOND = 0000000000000001 + WEAK_HBOND = 0000000000000010
 bitflags! {
@@ -84,6 +90,15 @@ pub const CARBONYL: CarbonylThresholds = CarbonylThresholds { distance: 3.6 };
 pub const METAL: MetalThresholds = MetalThresholds { distance: 2.8 };
 
 pub const MAINCHAIN_ATOMS: [&str; 5] = ["N", "C", "CA", "O", "OXT"];
+
+// The 20 standard amino acids, ported verbatim from real pdbe-arpeggio's
+// `STD_RES` (config.py). Used to decide which residues participate in
+// polypeptide-chain sequence-adjacency (waters, ions, and ligands never
+// do, regardless of numbering).
+pub const STANDARD_AMINO_ACIDS: [&str; 20] = [
+    "ALA", "CYS", "ASP", "GLU", "PHE", "GLY", "HIS", "ILE", "LYS", "LEU", "MET", "ASN", "PRO",
+    "GLN", "ARG", "SER", "THR", "VAL", "TRP", "TYR",
+];
 
 // Covalent and van der Waals radii (Å), keyed by element symbol (matched
 // case-insensitively against the CCD's `type_symbol`, which is uppercase).

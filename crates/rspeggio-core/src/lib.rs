@@ -1,4 +1,5 @@
 pub mod config;
+pub mod contacts;
 pub mod join;
 pub mod structure;
 pub mod typing;
