@@ -102,7 +102,7 @@ fn find_looped_block(lines: &[&str], prefix: &str) -> Option<LoopBlock> {
                 let mut data_end = header_end;
                 while data_end < lines.len() {
                     let t = lines[data_end].trim();
-                    if t.is_empty() || t == "#" || t == "loop_" || t.starts_with('_') {
+                    if t.is_empty() || t.starts_with('#') || t == "loop_" || t.starts_with('_') {
                         break;
                     }
                     data_end += 1;
@@ -503,6 +503,18 @@ mod tests {
         assert_eq!(component.atoms()[0].atom_id, "ZN");
         // no _chem_comp_bond loop at all for a bare ion -- zero bonds, not a failure
         assert!(component.bonds().is_empty());
+    }
+
+    #[test]
+    fn parses_a_component_whose_separator_line_is_hash_space_hash() {
+        // PO4's real RCSB export uses "#   #" as its loop separator (a
+        // fixed-width export quirk) instead of ADP's plain "# " -- schema
+        // drift that once made `find_loop_block` swallow the separator as
+        // a malformed data row and fail the whole parse.
+        let component = load_ccd_component("data/common/PO4.cif").expect("PO4 should parse");
+
+        assert_eq!(component.atoms().len(), 5, "P + O1..O4");
+        assert_eq!(component.bonds().len(), 4, "P-O1..P-O4");
     }
 
     #[test]
