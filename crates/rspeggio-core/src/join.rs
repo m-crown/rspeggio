@@ -19,7 +19,7 @@
 use rspeggio_ccd::component::{CcdAtom, CcdComponent};
 use std::collections::HashMap;
 
-use crate::structure::{StructureAtom, StructureResidue};
+use crate::structure::{Structure, StructureAtom, StructureResidue};
 
 pub struct JoinedAtom<'a> {
     pub structure_atom: &'a StructureAtom,
@@ -61,6 +61,18 @@ pub fn join_residue<'a>(
     }
 }
 
+// Joins every residue in a structure. Order matches `structure.residues`.
+pub fn join_structure<'a>(
+    structure: &'a Structure,
+    components: &'a HashMap<String, CcdComponent>,
+) -> Vec<JoinedResidue<'a>> {
+    structure
+        .residues
+        .iter()
+        .map(|residue| join_residue(residue, components))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,6 +103,32 @@ mod tests {
         let ccd_ca = ca.ccd_atom.expect("CA should match a CCD atom by name");
         assert_eq!(ccd_ca.element(), "C");
         assert!(!ccd_ca.aromatic());
+    }
+
+    #[test]
+    fn joins_every_residue_in_a_real_structure() {
+        let structure =
+            load_structure("../../tests/fixtures/structures/1UBQ.cif").expect("1UBQ should load");
+        let components = common_components();
+
+        let joined = join_structure(&structure, &components);
+
+        assert_eq!(joined.len(), structure.residues.len());
+        assert!(
+            joined.iter().all(|r| r.component.is_some()),
+            "1UBQ is amino acids + water only, all in the common bundle"
+        );
+
+        let total_atoms: usize = joined.iter().map(|r| r.atoms.len()).sum();
+        let matched_atoms = joined
+            .iter()
+            .flat_map(|r| &r.atoms)
+            .filter(|a| a.ccd_atom.is_some())
+            .count();
+        assert_eq!(
+            total_atoms, matched_atoms,
+            "every real atom in this protein-only fixture should match its CCD entry by name"
+        );
     }
 
     #[test]
