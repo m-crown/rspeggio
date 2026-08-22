@@ -221,6 +221,27 @@ pub fn type_atom(atom: &CcdAtom, component: &CcdComponent) -> AtomTypeBits {
         bits |= AtomTypeBits::HBOND_DONOR;
     }
 
+    // Weak hbond donor: any carbon with an attached hydrogen. C-H...X
+    // contacts are real but weaker/less directional than N/O/S-H...X
+    // (reflected in M1's separate, looser weak-hbond distance/angle
+    // thresholds) -- this is a much larger set than HBOND_DONOR, not a
+    // subset of it, since it's a different element (C) entirely.
+    if atom.element() == "C" && has_h_neighbor {
+        bits |= AtomTypeBits::WEAK_HBOND_DONOR;
+    }
+    // Weak hbond acceptor reuses the same lone-pair criterion as the
+    // strong acceptor rule, plus organohalogens: a halogen bonded to
+    // carbon (e.g. chlorobenzene's C-Cl) has lone pairs available for a
+    // weak/less-directional contact, same category as a C-H weak donor.
+    // A bare halide ion (e.g. the bundled Cl- ion) isn't covered by this
+    // branch -- it has no carbon neighbor -- and arguably shouldn't be:
+    // it's already a full anion, not a polarized C-X weak-acceptor site.
+    let is_organohalogen = matches!(atom.element(), "F" | "CL" | "BR" | "I")
+        && neighbors.iter().any(|(other, _)| other.element() == "C");
+    if bits.contains(AtomTypeBits::HBOND_ACCEPTOR) || is_organohalogen {
+        bits |= AtomTypeBits::WEAK_HBOND_ACCEPTOR;
+    }
+
     bits
 }
 
@@ -548,6 +569,92 @@ mod tests {
 
         assert!(type_atom(o, ala).contains(AtomTypeBits::NEG_IONISABLE));
         assert!(type_atom(oxt, ala).contains(AtomTypeBits::NEG_IONISABLE));
+    }
+
+    #[test]
+    fn alanines_methyl_carbon_is_a_weak_donor() {
+        let components = common_components();
+        let ala = components.get("ALA").expect("ALA should be bundled");
+        let cb = ala.atoms().iter().find(|a| a.atom_id() == "CB").unwrap();
+
+        assert!(type_atom(cb, ala).contains(AtomTypeBits::WEAK_HBOND_DONOR));
+    }
+
+    #[test]
+    fn alanines_carbonyl_carbon_has_no_hydrogen_so_is_not_a_weak_donor() {
+        let components = common_components();
+        let ala = components.get("ALA").expect("ALA should be bundled");
+        let c = ala.atoms().iter().find(|a| a.atom_id() == "C").unwrap();
+
+        assert!(!type_atom(c, ala).contains(AtomTypeBits::WEAK_HBOND_DONOR));
+    }
+
+    #[test]
+    fn phenylalanines_ipso_ring_carbon_has_no_hydrogen_so_is_not_a_weak_donor() {
+        let components = common_components();
+        let phe = components.get("PHE").expect("PHE should be bundled");
+        // CG bonds only to CB, CD1, CD2 -- it's where the ring attaches to
+        // the backbone, no room left for a hydrogen.
+        let cg = phe.atoms().iter().find(|a| a.atom_id() == "CG").unwrap();
+
+        assert!(!type_atom(cg, phe).contains(AtomTypeBits::WEAK_HBOND_DONOR));
+    }
+
+    #[test]
+    fn alanines_carbonyl_oxygen_is_both_a_strong_and_weak_acceptor() {
+        let components = common_components();
+        let ala = components.get("ALA").expect("ALA should be bundled");
+        let o = ala.atoms().iter().find(|a| a.atom_id() == "O").unwrap();
+
+        let bits = type_atom(o, ala);
+        assert!(bits.contains(AtomTypeBits::HBOND_ACCEPTOR));
+        assert!(bits.contains(AtomTypeBits::WEAK_HBOND_ACCEPTOR));
+    }
+
+    #[test]
+    fn arginines_guanidinium_nitrogen_is_not_a_weak_acceptor_either() {
+        let components = common_components();
+        let arg = components.get("ARG").expect("ARG should be bundled");
+        let nh1 = arg.atoms().iter().find(|a| a.atom_id() == "NH1").unwrap();
+
+        // weak acceptor is derived from the same lone-pair criterion as
+        // the strong acceptor rule, so the same guanidinium exclusion
+        // carries through here too.
+        assert!(!type_atom(nh1, arg).contains(AtomTypeBits::WEAK_HBOND_ACCEPTOR));
+    }
+
+    #[test]
+    fn chlorobenzenes_chlorine_is_a_weak_acceptor_but_not_a_strong_one() {
+        // Real fixture, not part of the common bundle -- chlorobenzene is
+        // the smallest real CCD entry with a genuine carbon-halogen bond
+        // (crates/rspeggio-core/tests/fixtures/ccd/8CL.cif), needed to
+        // test the organohalogen weak-acceptor rule against real data
+        // rather than leaving it an unverified gap.
+        let component = rspeggio_ccd::parser::load_ccd_component("tests/fixtures/ccd/8CL.cif")
+            .expect("8CL fixture should parse");
+        let cl = component
+            .atoms()
+            .iter()
+            .find(|a| a.atom_id() == "CL6")
+            .expect("8CL has a CL6 chlorine bonded to the ring");
+
+        let bits = type_atom(cl, &component);
+        assert!(bits.contains(AtomTypeBits::WEAK_HBOND_ACCEPTOR));
+        assert!(
+            !bits.contains(AtomTypeBits::HBOND_ACCEPTOR),
+            "chlorine isn't in the strong-acceptor element set (O, or N with a free lone pair)"
+        );
+    }
+
+    #[test]
+    fn a_bare_chloride_ion_is_not_flagged_as_a_weak_acceptor() {
+        // The bundled Cl- ion has no carbon neighbor at all -- the
+        // organohalogen rule shouldn't (and structurally can't) fire here.
+        let components = common_components();
+        let cl_ion = components.get("CL").expect("CL should be bundled");
+        let cl_atom = cl_ion.atoms().iter().find(|a| a.atom_id() == "CL").unwrap();
+
+        assert!(!type_atom(cl_atom, cl_ion).contains(AtomTypeBits::WEAK_HBOND_ACCEPTOR));
     }
 
     #[test]
