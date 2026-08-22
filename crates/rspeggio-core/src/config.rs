@@ -85,6 +85,83 @@ pub const METAL: MetalThresholds = MetalThresholds { distance: 2.8 };
 
 pub const MAINCHAIN_ATOMS: [&str; 5] = ["N", "C", "CA", "O", "OXT"];
 
+// Covalent and van der Waals radii (Å), keyed by element symbol (matched
+// case-insensitively against the CCD's `type_symbol`, which is uppercase).
+//
+// Source: Open Babel's `elementtable.h`
+// (https://github.com/openbabel/openbabel/blob/master/src/elementtable.h),
+// itself compiled from the Blue Obelisk Cheminformatics Data Repository
+// (http://www.blueobelisk.org/repos/blueobelisk/elements.xml). Real
+// pdbe-arpeggio does not hardcode these values either -- it pulls the
+// same numbers at runtime via `ob.GetCovalentRad`/`ob.GetVdwRad`
+// (interactions.py:1501/1509 in PDBeurope/arpeggio). Porting the published
+// numbers directly, rather than linking Open Babel, keeps decision 02's
+// no-FFI rule intact while still matching the oracle's actual values.
+//
+// TODO: revisit and extend as real fixture structures introduce elements
+// not covered here. Currently limited to what the corpus + common bundle
+// actually reference: H, C, N, O, F, Na, Mg, P, S, Cl, K, Ca, Mn, Fe, Co,
+// Ni, Cu, Zn, Br, I.
+const COVALENT_RADII: &[(&str, f64)] = &[
+    ("H", 0.31),
+    ("C", 0.76),
+    ("N", 0.71),
+    ("O", 0.66),
+    ("F", 0.57),
+    ("NA", 1.66),
+    ("MG", 1.41),
+    ("P", 1.07),
+    ("S", 1.05),
+    ("CL", 1.02),
+    ("K", 2.03),
+    ("CA", 1.76),
+    ("MN", 1.39),
+    ("FE", 1.32),
+    ("CO", 1.26),
+    ("NI", 1.24),
+    ("CU", 1.32),
+    ("ZN", 1.22),
+    ("BR", 1.20),
+    ("I", 1.39),
+];
+
+const VDW_RADII: &[(&str, f64)] = &[
+    ("H", 1.10),
+    ("C", 1.70),
+    ("N", 1.55),
+    ("O", 1.52),
+    ("F", 1.47),
+    ("NA", 2.27),
+    ("MG", 1.73),
+    ("P", 1.80),
+    ("S", 1.80),
+    ("CL", 1.75),
+    ("K", 2.75),
+    ("CA", 2.31),
+    ("MN", 2.05),
+    ("FE", 2.05),
+    ("CO", 2.00),
+    ("NI", 2.00),
+    ("CU", 2.00),
+    ("ZN", 2.10),
+    ("BR", 1.83),
+    ("I", 1.98),
+];
+
+pub fn covalent_radius(element: &str) -> Option<f64> {
+    COVALENT_RADII
+        .iter()
+        .find(|(symbol, _)| symbol.eq_ignore_ascii_case(element))
+        .map(|(_, radius)| *radius)
+}
+
+pub fn vdw_radius(element: &str) -> Option<f64> {
+    VDW_RADII
+        .iter()
+        .find(|(symbol, _)| symbol.eq_ignore_ascii_case(element))
+        .map(|(_, radius)| *radius)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,5 +188,50 @@ mod tests {
     fn validate_atoms() {
         assert!(MAINCHAIN_ATOMS.contains(&"CA"));
         assert!(!MAINCHAIN_ATOMS.contains(&"CB"));
+    }
+
+    #[test]
+    fn radii_match_openbabels_published_values() {
+        // Spot-check against the real elementtable.h values, not just
+        // whatever this table happens to already say.
+        assert_eq!(covalent_radius("C"), Some(0.76));
+        assert_eq!(vdw_radius("C"), Some(1.70));
+        assert_eq!(covalent_radius("O"), Some(0.66));
+        assert_eq!(vdw_radius("O"), Some(1.52));
+        assert_eq!(covalent_radius("ZN"), Some(1.22));
+        assert_eq!(vdw_radius("ZN"), Some(2.10));
+    }
+
+    #[test]
+    fn radii_lookup_is_case_insensitive() {
+        // CCD type_symbol is uppercase ("ZN"), but callers shouldn't have
+        // to know or care about that convention.
+        assert_eq!(covalent_radius("zn"), covalent_radius("ZN"));
+        assert_eq!(vdw_radius("Cl"), vdw_radius("CL"));
+    }
+
+    #[test]
+    fn radii_are_none_for_an_unlisted_element() {
+        assert_eq!(covalent_radius("XX"), None);
+        assert_eq!(vdw_radius("XX"), None);
+    }
+
+    #[test]
+    fn every_covalent_entry_has_a_matching_vdw_entry() {
+        // The two tables are meant to describe the same element set --
+        // catches a copy-paste gap between them if one is extended and
+        // the other forgotten.
+        for (symbol, _) in COVALENT_RADII {
+            assert!(
+                vdw_radius(symbol).is_some(),
+                "{symbol} has a covalent radius but no vdw radius"
+            );
+        }
+        for (symbol, _) in VDW_RADII {
+            assert!(
+                covalent_radius(symbol).is_some(),
+                "{symbol} has a vdw radius but no covalent radius"
+            );
+        }
     }
 }
