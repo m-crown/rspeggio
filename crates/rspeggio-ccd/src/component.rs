@@ -3,14 +3,24 @@ pub struct CcdAtom {
     pub(crate) atom_id: String,
     pub(crate) element: String,
     pub(crate) aromatic: bool,
+    // From `_chem_comp_atom.pdbx_leaving_atom_flag`: true for an atom that
+    // exists only in this component's free/monomeric form and is removed
+    // when it polymerizes into a chain in a non-terminal position (e.g. a
+    // standard amino acid's OXT/HXT and the second amine hydrogen). The
+    // atom that survives polymerization (e.g. the backbone amide H itself)
+    // is never a leaving atom -- that invariant is what lets binary
+    // donor/acceptor typing ignore this distinction; only a count of
+    // donor hydrogens needs to exclude leaving atoms for internal residues.
+    pub(crate) leaving: bool,
 }
 
 impl CcdAtom {
-    pub fn new(atom_id: String, element: String, aromatic: bool) -> Self {
+    pub fn new(atom_id: String, element: String, aromatic: bool, leaving: bool) -> Self {
         Self {
             atom_id,
             element,
             aromatic,
+            leaving,
         }
     }
 
@@ -24,6 +34,10 @@ impl CcdAtom {
 
     pub fn aromatic(&self) -> bool {
         self.aromatic
+    }
+
+    pub fn leaving(&self) -> bool {
+        self.leaving
     }
 }
 

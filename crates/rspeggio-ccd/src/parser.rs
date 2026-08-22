@@ -159,6 +159,7 @@ fn build_atoms(headers: &HashMap<String, usize>, data: &[&str]) -> Option<Vec<Cc
     let atom_id_idx = *headers.get("atom_id")?;
     let element_idx = *headers.get("type_symbol")?;
     let aromatic_idx = *headers.get("pdbx_aromatic_flag")?;
+    let leaving_idx = *headers.get("pdbx_leaving_atom_flag")?;
 
     data.iter()
         .map(|line| {
@@ -166,7 +167,8 @@ fn build_atoms(headers: &HashMap<String, usize>, data: &[&str]) -> Option<Vec<Cc
             let atom_id = tokens.get(atom_id_idx)?.clone();
             let element = tokens.get(element_idx)?.clone();
             let aromatic = tokens.get(aromatic_idx)?.as_str() == "Y";
-            Some(CcdAtom::new(atom_id, element, aromatic))
+            let leaving = tokens.get(leaving_idx)?.as_str() == "Y";
+            Some(CcdAtom::new(atom_id, element, aromatic, leaving))
         })
         .collect()
 }
@@ -386,7 +388,7 @@ mod tests {
         assert_eq!(atoms.len(), 42);
         assert_eq!(
             atoms[0],
-            CcdAtom::new("PB".to_string(), "P".to_string(), false)
+            CcdAtom::new("PB".to_string(), "P".to_string(), false, false)
         );
         let n9 = atoms
             .iter()
@@ -394,6 +396,10 @@ mod tests {
             .expect("N9 atom should be present");
         assert_eq!(n9.element, "N");
         assert!(n9.aromatic, "N9 is part of the purine ring, flagged Y");
+        assert!(
+            !n9.leaving,
+            "N9 is a core ring atom, not removed on polymerization"
+        );
     }
 
     #[test]
@@ -402,8 +408,9 @@ mod tests {
         headers.insert("atom_id".to_string(), 0);
         // "type_symbol" deliberately absent
         headers.insert("pdbx_aromatic_flag".to_string(), 2);
+        headers.insert("pdbx_leaving_atom_flag".to_string(), 3);
 
-        assert!(build_atoms(&headers, &["PB P N"]).is_none());
+        assert!(build_atoms(&headers, &["PB P N N"]).is_none());
     }
 
     #[test]
@@ -412,6 +419,7 @@ mod tests {
         headers.insert("atom_id".to_string(), 0);
         headers.insert("type_symbol".to_string(), 1);
         headers.insert("pdbx_aromatic_flag".to_string(), 2);
+        headers.insert("pdbx_leaving_atom_flag".to_string(), 3);
 
         // only two tokens, but pdbx_aromatic_flag is expected at index 2
         assert!(build_atoms(&headers, &["PB P"]).is_none());
@@ -477,6 +485,10 @@ mod tests {
         assert_eq!(atoms[0].atom_id, "ZN");
         assert_eq!(atoms[0].element, "ZN");
         assert!(!atoms[0].aromatic);
+        assert!(
+            !atoms[0].leaving,
+            "a bare ion has nothing to leave on polymerization"
+        );
     }
 
     #[test]
