@@ -68,6 +68,75 @@ fn bonded_neighbors<'a>(
         .collect()
 }
 
+// The carbon at the center of a guanidinium/amidinium-style cation: bonded
+// to exactly three nitrogens (arginine's CZ). The positive charge is
+// delocalized across the whole C+3N group -- not localized on one atom --
+// so this identifies the group by its shape, not by counting bonds on any
+// single nitrogen alone.
+fn is_guanidinium_carbon(atom: &CcdAtom, component: &CcdComponent) -> bool {
+    if atom.element() != "C" {
+        return false;
+    }
+    let neighbors = bonded_neighbors(atom, component);
+    neighbors.len() == 3 && neighbors.iter().all(|(n, _)| n.element() == "N")
+}
+
+// True for a nitrogen that's either a fully-saturated (4-bond) ammonium,
+// or one of the three nitrogens on a guanidinium carbon. Both are
+// positively charged with no lone pair left to accept a hydrogen bond.
+fn is_pos_ionisable_nitrogen(atom: &CcdAtom, component: &CcdComponent) -> bool {
+    if atom.element() != "N" {
+        return false;
+    }
+    let neighbors = bonded_neighbors(atom, component);
+    neighbors.len() == 4
+        || neighbors
+            .iter()
+            .any(|(n, _)| is_guanidinium_carbon(n, component))
+}
+
+// A carboxyl carbon: bonded to exactly two oxygens, one via a double bond
+// and one via a single bond, where that single-bonded oxygen is terminal
+// (its only other neighbor, if any, is a hydrogen -- not another carbon,
+// which would make this an ester rather than a free/ionisable acid).
+// Matches both the protonated (-COOH) and deprotonated (-COO-) forms,
+// since "ionisable" means "capable of carrying charge", not "does here".
+fn is_carboxyl_carbon(atom: &CcdAtom, component: &CcdComponent) -> bool {
+    if atom.element() != "C" {
+        return false;
+    }
+    let neighbors = bonded_neighbors(atom, component);
+    let oxygens: Vec<_> = neighbors
+        .iter()
+        .filter(|(n, _)| n.element() == "O")
+        .collect();
+    if oxygens.len() != 2 {
+        return false;
+    }
+    let has_double = oxygens
+        .iter()
+        .any(|(_, order)| **order == BondOrder::Double);
+    let single_oxygen_is_terminal = oxygens
+        .iter()
+        .find(|(_, order)| **order != BondOrder::Double)
+        .map(|(o, _)| {
+            bonded_neighbors(o, component)
+                .iter()
+                .all(|(n, _)| n.element() == "H" || n.atom_id() == atom.atom_id())
+        })
+        .unwrap_or(false);
+    has_double && single_oxygen_is_terminal
+}
+
+fn is_neg_ionisable_oxygen(atom: &CcdAtom, component: &CcdComponent) -> bool {
+    if atom.element() != "O" {
+        return false;
+    }
+    bonded_neighbors(atom, component)
+        .iter()
+        .any(|(n, _)| is_carboxyl_carbon(n, component))
+}
+
 pub fn type_atom(atom: &CcdAtom, component: &CcdComponent) -> AtomTypeBits {
     let mut bits = AtomTypeBits::empty();
 
@@ -112,6 +181,44 @@ pub fn type_atom(atom: &CcdAtom, component: &CcdComponent) -> AtomTypeBits {
             .all(|(other, _)| matches!(other.element(), "C" | "H"))
     {
         bits |= AtomTypeBits::HYDROPHOBE;
+    }
+
+    // Ionisable groups, identified structurally rather than by name --
+    // guanidinium/ammonium cations (positive), free/deprotonatable
+    // carboxyl groups (negative). These override the plain valence-based
+    // acceptor rule below: a nitrogen with a technically-free lone pair by
+    // bond count alone still isn't a real acceptor if that lone pair is
+    // tied up carrying a formal positive charge.
+    let pos_ionisable = is_pos_ionisable_nitrogen(atom, component)
+        || (atom.element() == "C" && is_guanidinium_carbon(atom, component));
+    let neg_ionisable = is_neg_ionisable_oxygen(atom, component);
+    if pos_ionisable {
+        bits |= AtomTypeBits::POS_IONISABLE;
+    }
+    if neg_ionisable {
+        bits |= AtomTypeBits::NEG_IONISABLE;
+    }
+
+    // Donor/acceptor capacity from the free-form CCD chemistry graph, not
+    // from whether any specific structure resolved a hydrogen -- most
+    // X-ray structures have none at all. See the `donor_hydrogen_count_vs_terminus`
+    // note: this is deliberately a boolean, not a hydrogen count, so
+    // terminus status (which changes the count but not this boolean)
+    // doesn't need to be known here.
+    let bond_count = neighbors.len();
+    let has_h_neighbor = neighbors.iter().any(|(other, _)| other.element() == "H");
+
+    // Every oxygen has a lone pair free to accept, regardless of whether
+    // it's also part of a negatively-ionisable carboxylate -- that charge
+    // state doesn't consume the lone pair the way a cation's does.
+    // Nitrogen has one too, unless all 4 bonding sites are used, or unless
+    // it's positively ionisable (guanidinium's resonance ties up what
+    // would otherwise look like a free lone pair by bond count alone).
+    if atom.element() == "O" || (atom.element() == "N" && bond_count <= 3 && !pos_ionisable) {
+        bits |= AtomTypeBits::HBOND_ACCEPTOR;
+    }
+    if matches!(atom.element(), "N" | "O" | "S") && has_h_neighbor {
+        bits |= AtomTypeBits::HBOND_DONOR;
     }
 
     bits
@@ -288,6 +395,175 @@ mod tests {
         let bits = type_atom(cz, phe);
         assert!(bits.contains(AtomTypeBits::AROMATIC));
         assert!(bits.contains(AtomTypeBits::HYDROPHOBE));
+    }
+
+    #[test]
+    fn alanines_backbone_amine_nitrogen_is_both_donor_and_acceptor() {
+        let components = common_components();
+        let ala = components.get("ALA").expect("ALA should be bundled");
+
+        // N is bonded to CA, H, H2 -- 3 bonds, has an H neighbor.
+        let n = ala
+            .atoms()
+            .iter()
+            .find(|a| a.atom_id() == "N")
+            .expect("ALA has a backbone N");
+
+        let bits = type_atom(n, ala);
+        assert!(bits.contains(AtomTypeBits::HBOND_DONOR));
+        assert!(bits.contains(AtomTypeBits::HBOND_ACCEPTOR));
+    }
+
+    #[test]
+    fn alanines_carbonyl_oxygen_is_acceptor_only() {
+        let components = common_components();
+        let ala = components.get("ALA").expect("ALA should be bundled");
+
+        // O is double-bonded only to C -- no attached hydrogen.
+        let o = ala
+            .atoms()
+            .iter()
+            .find(|a| a.atom_id() == "O")
+            .expect("ALA has a backbone carbonyl O");
+
+        let bits = type_atom(o, ala);
+        assert!(bits.contains(AtomTypeBits::HBOND_ACCEPTOR));
+        assert!(!bits.contains(AtomTypeBits::HBOND_DONOR));
+    }
+
+    #[test]
+    fn alanines_free_acid_hydroxyl_is_both_donor_and_acceptor() {
+        let components = common_components();
+        let ala = components.get("ALA").expect("ALA should be bundled");
+
+        // OXT is bonded to C and HXT -- 2 bonds, has an H neighbor.
+        let oxt = ala
+            .atoms()
+            .iter()
+            .find(|a| a.atom_id() == "OXT")
+            .expect("ALA has an OXT in its free-acid CCD form");
+
+        let bits = type_atom(oxt, ala);
+        assert!(bits.contains(AtomTypeBits::HBOND_DONOR));
+        assert!(bits.contains(AtomTypeBits::HBOND_ACCEPTOR));
+    }
+
+    #[test]
+    fn lysines_protonated_terminal_amine_is_donor_but_not_acceptor() {
+        let components = common_components();
+        let lys = components.get("LYS").expect("LYS should be bundled");
+
+        // NZ is bonded to CE, HZ1, HZ2, HZ3 -- 4 bonds, no lone pair left
+        // (this free-form CCD entry models the protonated NH3+ form).
+        let nz = lys
+            .atoms()
+            .iter()
+            .find(|a| a.atom_id() == "NZ")
+            .expect("LYS has an NZ");
+
+        let bits = type_atom(nz, lys);
+        assert!(bits.contains(AtomTypeBits::HBOND_DONOR));
+        assert!(
+            !bits.contains(AtomTypeBits::HBOND_ACCEPTOR),
+            "4 bonds leaves no lone pair to accept with"
+        );
+    }
+
+    #[test]
+    fn arginines_guanidinium_group_is_pos_ionisable_and_donor_but_never_acceptor() {
+        let components = common_components();
+        let arg = components.get("ARG").expect("ARG should be bundled");
+
+        for id in ["CZ", "NE", "NH1", "NH2"] {
+            let atom = arg
+                .atoms()
+                .iter()
+                .find(|a| a.atom_id() == id)
+                .unwrap_or_else(|| panic!("ARG should have a {id}"));
+            let bits = type_atom(atom, arg);
+            assert!(
+                bits.contains(AtomTypeBits::POS_IONISABLE),
+                "{id} should be part of the guanidinium group"
+            );
+            assert!(
+                !bits.contains(AtomTypeBits::HBOND_ACCEPTOR),
+                "{id}'s delocalized positive charge leaves no lone pair to accept with"
+            );
+        }
+        // CZ itself has no attached hydrogen -- NE/NH1/NH2 do.
+        let cz = arg.atoms().iter().find(|a| a.atom_id() == "CZ").unwrap();
+        assert!(!type_atom(cz, arg).contains(AtomTypeBits::HBOND_DONOR));
+        for id in ["NE", "NH1", "NH2"] {
+            let atom = arg.atoms().iter().find(|a| a.atom_id() == id).unwrap();
+            assert!(type_atom(atom, arg).contains(AtomTypeBits::HBOND_DONOR));
+        }
+    }
+
+    #[test]
+    fn lysines_nz_is_also_pos_ionisable() {
+        let components = common_components();
+        let lys = components.get("LYS").expect("LYS should be bundled");
+        let nz = lys.atoms().iter().find(|a| a.atom_id() == "NZ").unwrap();
+
+        assert!(type_atom(nz, lys).contains(AtomTypeBits::POS_IONISABLE));
+    }
+
+    #[test]
+    fn aspartates_side_chain_carboxylate_is_neg_ionisable_and_still_an_acceptor() {
+        let components = common_components();
+        let asp = components.get("ASP").expect("ASP should be bundled");
+
+        let od1 = asp.atoms().iter().find(|a| a.atom_id() == "OD1").unwrap();
+        let od2 = asp.atoms().iter().find(|a| a.atom_id() == "OD2").unwrap();
+
+        let od1_bits = type_atom(od1, asp);
+        let od2_bits = type_atom(od2, asp);
+
+        assert!(od1_bits.contains(AtomTypeBits::NEG_IONISABLE));
+        assert!(od2_bits.contains(AtomTypeBits::NEG_IONISABLE));
+        // negative ionisability doesn't consume the lone pair the way a
+        // cation's positive charge does -- both stay acceptors, matching
+        // arpeggio's own convention (ASPOD1/OD2 are both hbond-acceptor
+        // and neg-ionisable simultaneously).
+        assert!(od1_bits.contains(AtomTypeBits::HBOND_ACCEPTOR));
+        assert!(od2_bits.contains(AtomTypeBits::HBOND_ACCEPTOR));
+        // only OD2 carries the free-acid hydrogen in this CCD form.
+        assert!(!od1_bits.contains(AtomTypeBits::HBOND_DONOR));
+        assert!(od2_bits.contains(AtomTypeBits::HBOND_DONOR));
+    }
+
+    #[test]
+    fn alanines_free_acid_backbone_is_also_neg_ionisable_unlike_arpeggios_own_table() {
+        // Deliberate, known divergence from real arpeggio: its hardcoded
+        // PROT_ATOM_TYPES only lists ASP/GLU side chains as neg-ionisable,
+        // not any backbone terminus, even though a free residue's backbone
+        // -COOH (this CCD entry's O/OXT) is structurally the same acid
+        // group. Our rule identifies carboxyl groups generically by shape
+        // rather than by a curated per-residue list, so it correctly (if
+        // more broadly than the oracle) flags this one too.
+        let components = common_components();
+        let ala = components.get("ALA").expect("ALA should be bundled");
+        let o = ala.atoms().iter().find(|a| a.atom_id() == "O").unwrap();
+        let oxt = ala.atoms().iter().find(|a| a.atom_id() == "OXT").unwrap();
+
+        assert!(type_atom(o, ala).contains(AtomTypeBits::NEG_IONISABLE));
+        assert!(type_atom(oxt, ala).contains(AtomTypeBits::NEG_IONISABLE));
+    }
+
+    #[test]
+    fn a_plain_carbon_is_neither_donor_nor_acceptor() {
+        let components = common_components();
+        let ala = components.get("ALA").expect("ALA should be bundled");
+
+        let cb = ala
+            .atoms()
+            .iter()
+            .find(|a| a.atom_id() == "CB")
+            .expect("ALA has a CB");
+
+        let bits = type_atom(cb, ala);
+        assert!(!bits.contains(AtomTypeBits::HBOND_DONOR));
+        assert!(!bits.contains(AtomTypeBits::HBOND_ACCEPTOR));
     }
 
     #[test]
