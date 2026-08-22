@@ -13,6 +13,18 @@ impl CcdAtom {
             aromatic,
         }
     }
+
+    pub fn atom_id(&self) -> &str {
+        &self.atom_id
+    }
+
+    pub fn element(&self) -> &str {
+        &self.element
+    }
+
+    pub fn aromatic(&self) -> bool {
+        self.aromatic
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -54,6 +66,22 @@ impl CcdBond {
             order,
             aromatic,
         }
+    }
+
+    pub fn atom_id_1(&self) -> &str {
+        &self.atom_id_1
+    }
+
+    pub fn atom_id_2(&self) -> &str {
+        &self.atom_id_2
+    }
+
+    pub fn order(&self) -> &BondOrder {
+        &self.order
+    }
+
+    pub fn aromatic(&self) -> bool {
+        self.aromatic
     }
 }
 

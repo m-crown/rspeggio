@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 bitflags = "2"
 pdbtbx = "0.12"
+rspeggio-ccd = { path = "../rspeggio-ccd" }
