@@ -1,4 +1,4 @@
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CcdAtom {
     pub(crate) atom_id: String,
     pub(crate) element: String,
@@ -41,7 +41,7 @@ impl CcdAtom {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BondOrder {
     Single,
     Double,
@@ -64,7 +64,7 @@ impl BondOrder {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CcdBond {
     pub(crate) atom_id_1: String,
     pub(crate) atom_id_2: String,

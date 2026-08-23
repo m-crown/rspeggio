@@ -1,7 +1,6 @@
 pub mod config;
 pub mod contacts;
 pub mod join;
-pub mod structure;
 pub mod typing;
 
 pub fn add(left: u64, right: u64) -> u64 {

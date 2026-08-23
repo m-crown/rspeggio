@@ -5,5 +5,5 @@ edition = "2021"
 
 [dependencies]
 bitflags = "2"
-pdbtbx = "0.12"
+pdbtbx = { version = "0.12", features = ["rstar"] }
 rspeggio-ccd = { path = "../rspeggio-ccd" }
