@@ -1,5 +1,6 @@
 pub mod config;
 pub mod contacts;
+pub mod hydrogenate;
 pub mod join;
 pub mod typing;
 
