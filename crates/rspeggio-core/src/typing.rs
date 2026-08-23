@@ -217,7 +217,20 @@ pub fn type_atom(atom: &CcdAtom, component: &CcdComponent) -> AtomTypeBits {
     if atom.element() == "O" || (atom.element() == "N" && bond_count <= 3 && !pos_ionisable) {
         bits |= AtomTypeBits::HBOND_ACCEPTOR;
     }
-    if matches!(atom.element(), "N" | "O" | "S") && has_h_neighbor {
+    // A carboxyl group's hydroxyl oxygen is never a real donor, even when
+    // the CCD's static "ideal free molecule" entry happens to show an
+    // attached H (e.g. ASP/GLU's CCD form, or any residue's free-acid
+    // C-terminus). Carboxylic acid pKa is ~2-5, far below physiological
+    // pH (~7.4), so in solution the group is essentially always
+    // deprotonated regardless of what a single static structure encodes.
+    // This is a pH/pKa argument, not a per-residue exception: it applies
+    // to `neg_ionisable` generically, so it covers ASP, GLU, a real
+    // C-terminus, or any ligand's -COOH the same way.
+    let is_deprotonated_carboxyl_oxygen = atom.element() == "O" && neg_ionisable;
+    if matches!(atom.element(), "N" | "O" | "S")
+        && has_h_neighbor
+        && !is_deprotonated_carboxyl_oxygen
+    {
         bits |= AtomTypeBits::HBOND_DONOR;
     }
 
@@ -453,11 +466,15 @@ mod tests {
     }
 
     #[test]
-    fn alanines_free_acid_hydroxyl_is_both_donor_and_acceptor() {
+    fn alanines_free_acid_hydroxyl_is_an_acceptor_but_not_a_real_donor() {
         let components = common_components();
         let ala = components.get("ALA").expect("ALA should be bundled");
 
-        // OXT is bonded to C and HXT -- 2 bonds, has an H neighbor.
+        // OXT is bonded to C and HXT in this CCD entry's static free-acid
+        // form -- but a real C-terminal carboxylate is deprotonated at
+        // physiological pH (carboxylic acid pKa ~2-5, well below ~7.4),
+        // so it isn't a real donor regardless of what this one static
+        // structure happens to show.
         let oxt = ala
             .atoms()
             .iter()
@@ -465,7 +482,10 @@ mod tests {
             .expect("ALA has an OXT in its free-acid CCD form");
 
         let bits = type_atom(oxt, ala);
-        assert!(bits.contains(AtomTypeBits::HBOND_DONOR));
+        assert!(
+            !bits.contains(AtomTypeBits::HBOND_DONOR),
+            "a carboxyl oxygen is deprotonated at physiological pH, not a real donor"
+        );
         assert!(bits.contains(AtomTypeBits::HBOND_ACCEPTOR));
     }
 
@@ -548,9 +568,15 @@ mod tests {
         // and neg-ionisable simultaneously).
         assert!(od1_bits.contains(AtomTypeBits::HBOND_ACCEPTOR));
         assert!(od2_bits.contains(AtomTypeBits::HBOND_ACCEPTOR));
-        // only OD2 carries the free-acid hydrogen in this CCD form.
+        // OD2 carries the free-acid hydrogen in this CCD form, but a real
+        // aspartate side chain (pKa ~3.9) is deprotonated at physiological
+        // pH -- neither oxygen is a real donor, regardless of which one
+        // this static structure happens to protonate.
         assert!(!od1_bits.contains(AtomTypeBits::HBOND_DONOR));
-        assert!(od2_bits.contains(AtomTypeBits::HBOND_DONOR));
+        assert!(
+            !od2_bits.contains(AtomTypeBits::HBOND_DONOR),
+            "a carboxylate oxygen is deprotonated at physiological pH, not a real donor"
+        );
     }
 
     #[test]
