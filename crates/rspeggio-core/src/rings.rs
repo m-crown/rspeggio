@@ -35,10 +35,23 @@
 // (weak-donor CH...pi), and methionine-sulfur-pi. `HALOGENPI` isn't
 // covered: it needs "xbond donor" atom typing, which doesn't exist yet
 // (same gap the handoff notes for `XBOND` generally).
+//
+// `perceive_amide_groups`/`amide_geometry`/`classify_amide_amide`/
+// `classify_amide_ring` port the remaining ring-adjacent contact code
+// (`_perceive_amide_groups`/`__calculate_group_group_contacts`/
+// `__calculate_group_plane_contacts`): amide groups are perceived the same
+// way rings are (exact bond-graph traversal, this time for real
+// pdbe-arpeggio's `AMIDE_SMARTS` shape), then classified against another
+// amide or a ring by a single face-on (not 9-way) geometric test. See
+// `AmideGroup`'s doc for the one real scope gap this has that ring
+// perception doesn't: a standard backbone peptide amide spans two
+// residues (two different `CcdComponent`s), so isn't found by this --
+// only whole-single-component amides are (side-chain ASN/GLN, and
+// incidentally nucleobase ring lactams too).
 
 use crate::typing::AtomTypeBits;
 use pdbtbx::Residue;
-use rspeggio_ccd::component::CcdComponent;
+use rspeggio_ccd::component::{BondOrder, CcdComponent};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 type Point = (f64, f64, f64);
@@ -365,6 +378,157 @@ pub fn classify_ring_atom(
     }
 
     interactions
+}
+
+// An amide group (real pdbe-arpeggio's `AMIDE_SMARTS`,
+// `'[NX3][CX3](=[OX1])[#6]'`): a trigonal (3-connected) carbonyl carbon
+// bonded to a terminal (1-connected) double-bonded oxygen, a 3-connected
+// nitrogen, and one other carbon. Perceived the same way `perceive_rings`
+// is -- exact traversal over one component's own explicit bonds, no
+// re-perception.
+//
+// This only finds amides that are fully contained *within* one CCD
+// component's own bond graph -- ASN's OD1=CG-ND2 and GLN's OE1=CD-NE2 side
+// chains both are (confirmed against their real bond graphs below), but a
+// standard backbone peptide amide is *not*: its C=O and the next residue's
+// N are different components entirely (a `CcdComponent`'s bonds never
+// cross a residue boundary), so perceiving it would need real inter-residue
+// bond information this project doesn't build. That's a real, current
+// scope gap, not an oversight -- same shape as `hydrogenate.rs`'s water
+// gap or this module's own `HALOGENPI` gap above.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmideGroup {
+    pub nitrogen_id: String,
+    pub carbon_id: String,
+    pub oxygen_id: String,
+    pub other_carbon_id: String,
+}
+
+pub fn perceive_amide_groups(component: &CcdComponent) -> Vec<AmideGroup> {
+    let mut groups = Vec::new();
+
+    for atom in component.atoms() {
+        if atom.element() != "C" {
+            continue;
+        }
+        let neighbors = crate::typing::bonded_neighbors(atom, component);
+        if neighbors.len() != 3 {
+            continue; // not CX3 (trigonal)
+        }
+
+        let Some((oxygen, _)) = neighbors
+            .iter()
+            .find(|(n, order)| n.element() == "O" && **order == BondOrder::Double)
+        else {
+            continue;
+        };
+        // OX1: the oxygen's only bond is this double bond back to the
+        // carbon (a terminal keto oxygen, not e.g. a carboxylate's second,
+        // singly-bonded oxygen).
+        if crate::typing::bonded_neighbors(oxygen, component).len() != 1 {
+            continue;
+        }
+
+        let nitrogens: Vec<_> = neighbors
+            .iter()
+            .filter(|(n, order)| n.element() == "N" && **order != BondOrder::Double)
+            .collect();
+        let carbons: Vec<_> = neighbors
+            .iter()
+            .filter(|(n, _)| n.element() == "C")
+            .collect();
+        if nitrogens.len() != 1 || carbons.len() != 1 {
+            continue;
+        }
+        let (nitrogen, _) = nitrogens[0];
+        // NX3: exactly 3 connections total (e.g. an amide N with its two
+        // real hydrogens), not e.g. a positively ionisable NH3+/guanidinium
+        // nitrogen with a 4th substituent.
+        if crate::typing::bonded_neighbors(nitrogen, component).len() != 3 {
+            continue;
+        }
+        let (other_carbon, _) = carbons[0];
+
+        groups.push(AmideGroup {
+            nitrogen_id: nitrogen.atom_id().to_string(),
+            carbon_id: atom.atom_id().to_string(),
+            oxygen_id: oxygen.atom_id().to_string(),
+            other_carbon_id: other_carbon.atom_id().to_string(),
+        });
+    }
+
+    groups
+}
+
+// One perceived amide group's real geometry in a specific residue
+// instance. Same shape as `RingGeometry` (a center + a unit normal), kept
+// as its own type rather than reused -- an amide group and a ring are
+// conceptually distinct real pdbe-arpeggio contact participants (group vs
+// plane), even though the geometry each carries is identical.
+pub struct AmideGeometry {
+    pub center: Point,
+    pub normal: Point,
+}
+
+// Resolves `amide`'s real center and normal from `residue`'s actual atom
+// positions. `center` is the midpoint of the C-N bond (real pdbe-arpeggio's
+// `bond_centroid`, `interactions.py:1564` -- deliberately not the C-O-N
+// centroid, which it computes too but doesn't actually use for this).
+// `normal` is the unit normal of the real C-O-N plane: three points define
+// an exact plane, so a plain cross product recovers the same plane real
+// pdbe-arpeggio gets via SVD (`interactions.py`'s comment about `np.linalg.svd`)
+// without needing a full least-squares solve for what's already an exact
+// fit. `None` if any of the three real atoms isn't resolved in this residue.
+pub fn amide_geometry(amide: &AmideGroup, residue: &Residue) -> Option<AmideGeometry> {
+    let pos = |id: &str| residue.atoms().find(|a| a.name() == id).map(|a| a.pos());
+    let c = pos(&amide.carbon_id)?;
+    let o = pos(&amide.oxygen_id)?;
+    let n = pos(&amide.nitrogen_id)?;
+
+    let center = ((c.0 + n.0) / 2.0, (c.1 + n.1) / 2.0, (c.2 + n.2) / 2.0);
+    let normal = normalize(cross(subtract(o, c), subtract(n, c)));
+
+    Some(AmideGeometry { center, normal })
+}
+
+fn cross(a: Point, b: Point) -> Point {
+    (
+        a.1 * b.2 - a.2 * b.1,
+        a.2 * b.0 - a.0 * b.2,
+        a.0 * b.1 - a.1 * b.0,
+    )
+}
+
+// Shared by amide-amide and amide-ring: real pdbe-arpeggio classifies both
+// with the same "face-on only" geometric test (`__calculate_group_group_contacts`/
+// `__calculate_group_plane_contacts`) -- within the same 6.0A centroid cutoff as
+// ring-ring, but unlike ring-ring's 9-way binning, only a single
+// dihedral<=30/theta<=30 pass/fail, no looser tiers.
+fn face_on_distance(
+    center_1: Point,
+    normal_1: Point,
+    center_2: Point,
+    normal_2: Point,
+) -> Option<f64> {
+    let distance = length(subtract(center_1, center_2));
+    if distance > CENTROID_DISTANCE_MAX {
+        return None;
+    }
+
+    let dihedral = axis_angle_degrees(normal_1, normal_2);
+    let theta = axis_angle_degrees(normal_1, subtract(center_1, center_2));
+
+    (dihedral <= 30.0 && theta <= 30.0).then_some(distance)
+}
+
+// Real pdbe-arpeggio's `AMIDEAMIDE` contact (`interactions.py:1281`).
+pub fn classify_amide_amide(a: &AmideGeometry, b: &AmideGeometry) -> Option<f64> {
+    face_on_distance(a.center, a.normal, b.center, b.normal)
+}
+
+// Real pdbe-arpeggio's `AMIDERING` contact (`interactions.py:1364`).
+pub fn classify_amide_ring(amide: &AmideGeometry, ring: &RingGeometry) -> Option<f64> {
+    face_on_distance(amide.center, amide.normal, ring.center, ring.normal)
 }
 
 #[cfg(test)]
@@ -769,5 +933,169 @@ mod tests {
             AtomTypeBits::AROMATIC | AtomTypeBits::WEAK_HBOND_DONOR,
         );
         assert!(interactions.is_empty());
+    }
+
+    #[test]
+    fn asparagines_side_chain_amide_is_perceived_from_its_real_bond_graph() {
+        let components = common_components();
+        let asn = components.get("ASN").expect("ASN should be bundled");
+
+        let groups = perceive_amide_groups(asn);
+        assert_eq!(
+            groups.len(),
+            1,
+            "ASN has exactly one amide group (its side chain)"
+        );
+        assert_eq!(
+            groups[0],
+            AmideGroup {
+                nitrogen_id: "ND2".to_string(),
+                carbon_id: "CG".to_string(),
+                oxygen_id: "OD1".to_string(),
+                other_carbon_id: "CB".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn glutamines_side_chain_amide_is_perceived_from_its_real_bond_graph() {
+        let components = common_components();
+        let gln = components.get("GLN").expect("GLN should be bundled");
+
+        let groups = perceive_amide_groups(gln);
+        assert_eq!(
+            groups.len(),
+            1,
+            "GLN has exactly one amide group (its side chain)"
+        );
+        assert_eq!(
+            groups[0],
+            AmideGroup {
+                nitrogen_id: "NE2".to_string(),
+                carbon_id: "CD".to_string(),
+                oxygen_id: "OE1".to_string(),
+                other_carbon_id: "CG".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn alanine_has_no_amide_groups() {
+        // ALA's backbone carbonyl carbon (C) has no nitrogen neighbor at
+        // all in this free/monomeric CCD entry -- the real peptide-bond
+        // nitrogen belongs to the *next* residue, a different component
+        // entirely (see this module's doc comment on the scope gap).
+        let components = common_components();
+        let ala = components.get("ALA").expect("ALA should be bundled");
+        assert!(perceive_amide_groups(ala).is_empty());
+    }
+
+    #[test]
+    fn guanines_ring_lactam_is_also_a_real_amide_group() {
+        // Not just protein side chains: guanine's own ring carbonyl
+        // (N1-C6=O6, with C5 as the pattern's 4th "other carbon") matches
+        // the same generic amide shape -- real pdbe-arpeggio's SMARTS-based
+        // perception isn't protein-specific either, and this project's
+        // bond-graph version shouldn't be either.
+        let components = common_components();
+        let g = components.get("G").expect("G (guanine) should be bundled");
+
+        let groups = perceive_amide_groups(g);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].nitrogen_id, "N1");
+        assert_eq!(groups[0].carbon_id, "C6");
+        assert_eq!(groups[0].oxygen_id, "O6");
+    }
+
+    #[test]
+    fn a_real_amide_amide_contact_is_found_between_asn_and_gln_in_1ca2() {
+        // Found by an ad-hoc sweep of every amide-amide pair across all 6
+        // structure fixtures: 1CA2's ASN67 and GLN92 side-chain amides sit
+        // ~4.2A apart, face-on (dihedral and theta both well under 30
+        // degrees) -- the only real amide-amide pair found in any fixture,
+        // which is itself informative: this is a genuinely rare geometry,
+        // not a common one this project should expect to see constantly.
+        let (pdb, _errors) =
+            pdbtbx::open("../../tests/fixtures/structures/1CA2.cif").expect("1CA2 should load");
+        let components = common_components();
+
+        let asn = components.get("ASN").expect("ASN should be bundled");
+        let gln = components.get("GLN").expect("GLN should be bundled");
+        let asn_group = perceive_amide_groups(asn)
+            .into_iter()
+            .next()
+            .expect("ASN has an amide group");
+        let gln_group = perceive_amide_groups(gln)
+            .into_iter()
+            .next()
+            .expect("GLN has an amide group");
+
+        let asn67 = pdb
+            .residues()
+            .find(|r| r.id().0 == 67 && r.name() == Some("ASN"))
+            .expect("ASN67 should be present in 1CA2");
+        let gln92 = pdb
+            .residues()
+            .find(|r| r.id().0 == 92 && r.name() == Some("GLN"))
+            .expect("GLN92 should be present in 1CA2");
+
+        let asn_geometry = amide_geometry(&asn_group, asn67).expect("ASN67's amide should resolve");
+        let gln_geometry = amide_geometry(&gln_group, gln92).expect("GLN92's amide should resolve");
+
+        let distance = classify_amide_amide(&asn_geometry, &gln_geometry)
+            .expect("ASN67/GLN92 should be a real face-on amide-amide contact");
+        assert!(
+            (4.0..4.5).contains(&distance),
+            "expected ASN67-GLN92 amide centroid distance around 4.2A, got {distance}"
+        );
+    }
+
+    #[test]
+    fn two_face_on_coplanar_amides_are_classified_as_a_contact() {
+        // None of this crate's real structure fixtures happen to contain a
+        // real AMIDERING pair within 6A/30-degrees (confirmed by the same
+        // sweep that found the ASN67-GLN92 AMIDEAMIDE case above) -- so,
+        // same approach as `two_coplanar_rings_far_apart_are_face_to_face`,
+        // this pins the exact geometric boundary with hand-built points
+        // rather than leaving the pass case entirely unverified.
+        let amide = AmideGeometry {
+            center: (0.0, 0.0, 0.0),
+            normal: (0.0, 0.0, 1.0),
+        };
+        let ring = RingGeometry {
+            center: (0.0, 0.0, 4.0),
+            normal: (0.0, 0.0, 1.0),
+        };
+
+        let distance = classify_amide_ring(&amide, &ring).expect("face-on within 6A");
+        assert!((distance - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_perpendicular_amide_ring_pair_is_not_a_face_on_contact() {
+        let amide = AmideGeometry {
+            center: (0.0, 0.0, 0.0),
+            normal: (0.0, 0.0, 1.0),
+        };
+        let ring = RingGeometry {
+            center: (4.0, 0.0, 0.0),
+            normal: (1.0, 0.0, 0.0),
+        };
+
+        assert!(classify_amide_ring(&amide, &ring).is_none());
+    }
+
+    #[test]
+    fn an_amide_pair_beyond_the_centroid_cutoff_is_not_a_contact() {
+        let a = AmideGeometry {
+            center: (0.0, 0.0, 0.0),
+            normal: (0.0, 0.0, 1.0),
+        };
+        let b = AmideGeometry {
+            center: (0.0, 0.0, 6.1),
+            normal: (0.0, 0.0, 1.0),
+        };
+
+        assert!(classify_amide_amide(&a, &b).is_none());
     }
 }
