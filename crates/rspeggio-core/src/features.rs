@@ -8,8 +8,12 @@
 // chemistry, typed, then checked against the distance thresholds already
 // ported in `config.rs`.
 //
-// IONIC, HYDROPHOBIC, CARBONYL, METAL_COMPLEX need only distance +
-// typing. HBOND/WEAK_HBOND need a real donor-hydrogen position to check
+// IONIC, HYDROPHOBIC, CARBONYL, METAL_COMPLEX, AROMATIC need only distance
+// + typing (AROMATIC here is real pdbe-arpeggio's simple atom-atom version,
+// `interactions.py:916` -- both atoms typed aromatic within 4.0A; the
+// separate ring-plane/centroid geometry that M6 also needed lives in
+// `rings.rs` as its own plane-plane contact type, not an atom-pair
+// feature). HBOND/WEAK_HBOND need a real donor-hydrogen position to check
 // the donor-H...acceptor angle -- this module uses `hydrogenate` to place
 // one wherever the donor's CCD shape is covered (real or resolved atoms
 // take priority over a placed one), and falls back to the plan's own
@@ -316,6 +320,13 @@ pub fn classify_features(
         features |= FeatureBits::HYDROPHOBIC;
     }
 
+    if contact.distance <= config::AROMATIC.distance
+        && a1.bits.contains(AtomTypeBits::AROMATIC)
+        && a2.bits.contains(AtomTypeBits::AROMATIC)
+    {
+        features |= FeatureBits::AROMATIC;
+    }
+
     if contact.distance <= config::CARBONYL.distance
         && either_order(
             a1.bits,
@@ -448,7 +459,27 @@ mod tests {
             if features.contains(FeatureBits::WEAK_HBOND) {
                 assert!(c.distance <= config::WEAK_HBOND.distance);
             }
+            if features.contains(FeatureBits::AROMATIC) {
+                assert!(c.distance <= config::AROMATIC.distance);
+            }
         }
+    }
+
+    #[test]
+    fn a_real_aromatic_contact_is_found_in_1ca2() {
+        // 1UBQ's aromatic side chains never happen to pack within the 4.0A
+        // threshold (confirmed directly: closest inter-residue
+        // aromatic-aromatic atom pair is ~5.6A) -- 1CA2 is larger, with 238
+        // aromatic ring atoms, and has real pairs as close as ~3.1A.
+        let (pdb, _errors) =
+            pdbtbx::open("../../tests/fixtures/structures/1CA2.cif").expect("1CA2 should load");
+        let components = common_components();
+        let contacts = find_contacts(&pdb, config::CONTACT_TYPES_MAX_DIST);
+
+        let found = contacts
+            .iter()
+            .any(|c| classify_features(c, &components).contains(FeatureBits::AROMATIC));
+        assert!(found, "expected at least one real aromatic contact in 1CA2");
     }
 
     #[test]

@@ -67,6 +67,10 @@ pub struct MetalThresholds {
     pub distance: f64,
 }
 
+pub struct AromaticThresholds {
+    pub distance: f64,
+}
+
 pub const CONTACT_TYPES_MAX_DIST: f64 = 4.5;
 
 pub const HBOND: HbondThresholds = HbondThresholds {
@@ -88,6 +92,13 @@ pub const HYDROPHOBIC: HydrophobicThresholds = HydrophobicThresholds { distance:
 pub const CARBONYL: CarbonylThresholds = CarbonylThresholds { distance: 3.6 };
 
 pub const METAL: MetalThresholds = MetalThresholds { distance: 2.8 };
+
+// Simple atom-atom aromatic contact: both atoms typed aromatic and within
+// this distance (real pdbe-arpeggio's `CONTACT_TYPES['aromatic']['distance']`,
+// `interactions.py:916`) -- distinct from `rings::CENTROID_DISTANCE_MAX`,
+// which gates the separate ring-*plane*-geometry (centroid/normal)
+// contacts in `rings.rs`, not this per-atom-pair feature bit.
+pub const AROMATIC: AromaticThresholds = AromaticThresholds { distance: 4.0 };
 
 pub const MAINCHAIN_ATOMS: [&str; 5] = ["N", "C", "CA", "O", "OXT"];
 
