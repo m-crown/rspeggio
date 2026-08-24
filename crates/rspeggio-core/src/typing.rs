@@ -44,7 +44,7 @@ const METAL_ELEMENTS: &[&str] = &["NA", "MG", "CA", "K", "ZN", "FE", "MN", "CU",
 // list yet, so this is a linear scan; fine at CCD-component scale (single
 // digits to low hundreds of atoms), worth revisiting only if typing ever
 // needs to run on much larger components.
-fn bonded_neighbors<'a>(
+pub(crate) fn bonded_neighbors<'a>(
     atom: &CcdAtom,
     component: &'a CcdComponent,
 ) -> Vec<(&'a CcdAtom, &'a BondOrder)> {

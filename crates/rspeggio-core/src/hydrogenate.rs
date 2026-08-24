@@ -54,6 +54,15 @@ fn length(v: Point) -> f64 {
     (v.0 * v.0 + v.1 * v.1 + v.2 * v.2).sqrt()
 }
 
+// The angle a-vertex-b, in degrees. Used both by this module's own tests
+// and, via `hydrogenate::angle_degrees`, by `features.rs`'s real hbond
+// angle check.
+pub fn angle_degrees(a: Point, vertex: Point, b: Point) -> f64 {
+    let v1 = normalize(subtract(a, vertex));
+    let v2 = normalize(subtract(b, vertex));
+    dot(v1, v2).clamp(-1.0, 1.0).acos().to_degrees()
+}
+
 fn normalize(v: Point) -> Point {
     let len = length(v);
     (v.0 / len, v.1 / len, v.2 / len)
@@ -374,12 +383,6 @@ mod tests {
     use super::*;
     use pdbtbx::{ContainsAtomConformer, ContainsAtomConformerResidue};
 
-    fn angle_deg(a: Point, vertex: Point, b: Point) -> f64 {
-        let v1 = normalize(subtract(a, vertex));
-        let v2 = normalize(subtract(b, vertex));
-        dot(v1, v2).clamp(-1.0, 1.0).acos().to_degrees()
-    }
-
     #[test]
     fn places_alanines_ha_from_real_1ubq_geometry_at_the_right_length_and_angles() {
         // Real MET1 heavy-atom positions, read directly from
@@ -441,7 +444,7 @@ mod tests {
         // shouldn't be wildly wrong (e.g. pointing back through an
         // existing neighbor).
         for neighbor in [n, c, cb] {
-            let angle = angle_deg(ha, ca, neighbor);
+            let angle = angle_degrees(ha, ca, neighbor);
             assert!(
                 (80.0..140.0).contains(&angle),
                 "HA-CA-neighbor angle {angle} is nowhere near a plausible tetrahedral range"
@@ -509,7 +512,7 @@ mod tests {
         // direction is genuinely opposite both known bonds, not just
         // "somewhere plausible".
         for neighbor in [cg, ce1] {
-            let angle = angle_deg(hd1, nd1, neighbor);
+            let angle = angle_degrees(hd1, nd1, neighbor);
             assert!(
                 angle > 90.0,
                 "HD1 should point away from {neighbor:?}, got angle {angle}"
@@ -568,7 +571,7 @@ mod tests {
         // Fully determined here too (the formula fixes the angle exactly
         // at construction time, even though the azimuth around CB-OG is
         // arbitrary).
-        let angle = angle_deg(hg, og, cb);
+        let angle = angle_degrees(hg, og, cb);
         assert!(
             (angle - 109.471_22).abs() < 1e-6,
             "OG-HG should sit at the exact sp3 angle from CB by construction, got {angle}"
@@ -615,7 +618,7 @@ mod tests {
 
         // Fully determined by the single real constraint (angle to CA),
         // exact regardless of the reference-driven azimuth choice.
-        let angle_to_ca = angle_deg(h, n, ca);
+        let angle_to_ca = angle_degrees(h, n, ca);
         assert!(
             (angle_to_ca - 120.0).abs() < 1e-6,
             "N-H should sit at the exact sp2 angle from CA by construction, got {angle_to_ca}"
@@ -666,14 +669,14 @@ mod tests {
                 (actual_length - bond_length).abs() < 1e-9,
                 "bond length should be exact by construction, got {actual_length}"
             );
-            let angle_to_cg = angle_deg(h, nd2, cg);
+            let angle_to_cg = angle_degrees(h, nd2, cg);
             assert!(
                 (angle_to_cg - 120.0).abs() < 1e-6,
                 "N-H should sit at the exact sp2 angle from CG by construction, got {angle_to_cg}"
             );
         }
 
-        let angle_between_hydrogens = angle_deg(hd21, nd2, hd22);
+        let angle_between_hydrogens = angle_degrees(hd21, nd2, hd22);
         assert!(
             (angle_between_hydrogens - 120.0).abs() < 1e-6,
             "the two hydrogens should also be 120 degrees apart from each other, got {angle_between_hydrogens}"
@@ -741,7 +744,7 @@ mod tests {
         // real CA-CB-OG angle is to ideal tetrahedral (it's ~110-111
         // degrees in practice, not exactly 109.47 -- see the CA/HA test's
         // note on real backbone geometry).
-        let angle_between_hydrogens = angle_deg(hb2, cb, hb3);
+        let angle_between_hydrogens = angle_degrees(hb2, cb, hb3);
         assert!(
             (angle_between_hydrogens - 109.471_22).abs() < 1e-6,
             "HB2-CB-HB3 should be exactly tetrahedral by construction, got {angle_between_hydrogens}"
@@ -752,7 +755,7 @@ mod tests {
         // CA-CB-OG input angle).
         for neighbor in [ca, og] {
             for h in [hb2, hb3] {
-                let angle = angle_deg(h, cb, neighbor);
+                let angle = angle_degrees(h, cb, neighbor);
                 assert!(
                     (95.0..125.0).contains(&angle),
                     "HB-CB-neighbor angle {angle} is nowhere near a plausible tetrahedral range"
@@ -794,7 +797,7 @@ mod tests {
             );
             // Guaranteed exactly by construction: the single real
             // constraint (angle to SD) is fixed regardless of azimuth.
-            let angle_to_sd = angle_deg(h, ce, sd);
+            let angle_to_sd = angle_degrees(h, ce, sd);
             assert!(
                 (angle_to_sd - 109.471_22).abs() < 1e-6,
                 "H-CE-SD should sit at the exact tetrahedral angle by construction, got {angle_to_sd}"
@@ -806,7 +809,7 @@ mod tests {
         // real property of a symmetric tetrahedral arrangement, not just
         // a coincidence of this formula).
         for (a, b) in [(he1, he2), (he2, he3), (he1, he3)] {
-            let angle = angle_deg(a, ce, b);
+            let angle = angle_degrees(a, ce, b);
             assert!(
                 // Slightly looser than the direct angle-to-SD check above:
                 // this one compounds more trig operations (two azimuth

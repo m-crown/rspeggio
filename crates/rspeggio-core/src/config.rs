@@ -40,31 +40,31 @@ struct Sift {
 }
 
 pub struct HbondThresholds {
-    distance: f64,
-    polar_distance: f64,
-    angle_degrees: f64,
+    pub distance: f64,
+    pub polar_distance: f64,
+    pub angle_degrees: f64,
 }
 
 pub struct WeakHbondThresholds {
-    distance: f64,
-    weak_polar_distance: f64,
-    angle_degrees: f64,
+    pub distance: f64,
+    pub weak_polar_distance: f64,
+    pub angle_degrees: f64,
 }
 
 pub struct IonicThresholds {
-    distance: f64,
+    pub distance: f64,
 }
 
 pub struct HydrophobicThresholds {
-    distance: f64,
+    pub distance: f64,
 }
 
 pub struct CarbonylThresholds {
-    distance: f64,
+    pub distance: f64,
 }
 
 pub struct MetalThresholds {
-    distance: f64,
+    pub distance: f64,
 }
 
 pub const CONTACT_TYPES_MAX_DIST: f64 = 4.5;
