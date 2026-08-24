@@ -28,7 +28,15 @@
 // cross-product terms around the ring's traversal order, robust to a ring
 // that isn't perfectly planar in real coordinates, unlike a single
 // three-point cross product).
+//
+// `classify_ring_atom` covers the other half of real pdbe-arpeggio's ring
+// contact code (`__calculate_atom_plane_contacts`): a non-aromatic atom
+// sitting close to a ring's face -- cation-pi, donor-pi, carbon-pi
+// (weak-donor CH...pi), and methionine-sulfur-pi. `HALOGENPI` isn't
+// covered: it needs "xbond donor" atom typing, which doesn't exist yet
+// (same gap the handoff notes for `XBOND` generally).
 
+use crate::typing::AtomTypeBits;
 use pdbtbx::Residue;
 use rspeggio_ccd::component::CcdComponent;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -282,6 +290,81 @@ pub fn classify_ring_ring(
     };
 
     Some((distance, kind))
+}
+
+// The 4 (of 5 real) ring-atom contact types this project can currently
+// type. Real pdbe-arpeggio also has `HALOGENPI` (a halogen-bond-donor
+// atom near a ring face) -- omitted here, not silently: it needs "xbond
+// donor" atom typing this project hasn't built (see module doc).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RingAtomInteraction {
+    CarbonPi,
+    CationPi,
+    DonorPi,
+    MetSulphurPi,
+}
+
+// Real pdbe-arpeggio's ring-atom thresholds
+// (`config.CONTACT_TYPES['aromatic']['atom_aromatic_distance']`/
+// `['met_sulphur_aromatic_distance']`). `MET_SULPHUR_DISTANCE_MAX` is
+// deliberately much larger (6.0A vs 4.5A) -- real pdbe-arpeggio gives a
+// methionine sulfur's lone pair a longer reach toward a ring face than an
+// ordinary donor/cation, reflecting sulfur's larger, more polarizable
+// electron cloud.
+pub const ATOM_AROMATIC_DISTANCE_MAX: f64 = 4.5;
+pub const MET_SULPHUR_DISTANCE_MAX: f64 = 6.0;
+
+// Classifies every ring-atom interaction between `ring` and one nearby
+// atom, given that atom's real position, element, owning residue name, and
+// already-computed `AtomTypeBits` (from `typing::type_atom` -- this
+// function takes bits rather than a `CcdAtom`+`CcdComponent` pair so it
+// stays agnostic to how the caller got them, same as `features.rs`'s
+// `classify_features` takes already-typed atoms rather than re-deriving
+// types itself). Can return more than one interaction (e.g. a weak-donor
+// carbon that's also positively ionisable would be both CARBONPI and
+// CATIONPI, mirroring real pdbe-arpeggio's `potential_interactions` set).
+pub fn classify_ring_atom(
+    ring: &RingGeometry,
+    atom_pos: Point,
+    atom_element: &str,
+    atom_residue_name: &str,
+    atom_bits: AtomTypeBits,
+) -> Vec<RingAtomInteraction> {
+    let mut interactions = Vec::new();
+
+    // No aromatic-atom-to-ring interactions -- an aromatic atom belongs to
+    // its own ring's plane-plane classification instead (`classify_ring_ring`).
+    if atom_bits.contains(AtomTypeBits::AROMATIC) {
+        return interactions;
+    }
+
+    let distance = length(subtract(atom_pos, ring.center));
+
+    if distance <= ATOM_AROMATIC_DISTANCE_MAX {
+        let theta = axis_angle_degrees(ring.normal, subtract(ring.center, atom_pos));
+        if theta <= 30.0 {
+            if atom_element.eq_ignore_ascii_case("C")
+                && atom_bits.contains(AtomTypeBits::WEAK_HBOND_DONOR)
+            {
+                interactions.push(RingAtomInteraction::CarbonPi);
+            }
+            if atom_bits.contains(AtomTypeBits::POS_IONISABLE) {
+                interactions.push(RingAtomInteraction::CationPi);
+            }
+            if atom_bits.contains(AtomTypeBits::HBOND_DONOR) {
+                interactions.push(RingAtomInteraction::DonorPi);
+            }
+        }
+    }
+
+    if distance <= MET_SULPHUR_DISTANCE_MAX
+        && atom_element.eq_ignore_ascii_case("S")
+        && atom_residue_name.eq_ignore_ascii_case("MET")
+    {
+        interactions.push(RingAtomInteraction::MetSulphurPi);
+    }
+
+    interactions
 }
 
 #[cfg(test)]
@@ -547,5 +630,144 @@ mod tests {
             (5.0..6.0).contains(&distance),
             "expected PHE66-PHE95 centroid distance around 5.4A, got {distance}"
         );
+    }
+
+    // Shared by every `classify_ring_atom` real-data test below: BPTI
+    // (5PTI) is small and already a fixture elsewhere in this crate, and
+    // an ad-hoc sweep of every ring-atom pair in it (plus 1UBQ/1MBO/1FLV/
+    // 4FXC/1CA2) turned up real, independently-verifiable examples of
+    // every interaction this project can currently type.
+    fn bpti_ring(comp_id: &str, components: &HashMap<String, CcdComponent>) -> RingAtoms {
+        let component = components
+            .get(comp_id)
+            .unwrap_or_else(|| panic!("{comp_id} should be bundled"));
+        perceive_rings(component)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("{comp_id} should have a ring"))
+    }
+
+    fn bpti_residue<'a>(pdb: &'a pdbtbx::PDB, seq_id: isize, comp_id: &str) -> &'a pdbtbx::Residue {
+        pdb.residues()
+            .find(|r| r.id().0 == seq_id && r.name() == Some(comp_id))
+            .unwrap_or_else(|| panic!("{comp_id}{seq_id} should be present in BPTI"))
+    }
+
+    #[test]
+    fn a_real_carbon_pi_contact_is_found_in_bpti() {
+        // PHE4's ring face sits close to ARG42's CB -- a plain aliphatic
+        // carbon with an attached hydrogen (weak hbond donor), not
+        // ionisable or a strong donor, so CARBONPI should be the only
+        // interaction found.
+        let (pdb, _errors) =
+            pdbtbx::open("tests/fixtures/structures/5PTI.cif").expect("BPTI should load");
+        let components = common_components();
+
+        let ring = bpti_ring("PHE", &components);
+        let phe4 = bpti_residue(&pdb, 4, "PHE");
+        let geometry = ring_geometry(&ring, phe4).expect("PHE4's ring should resolve");
+
+        let arg42 = bpti_residue(&pdb, 42, "ARG");
+        let cb = arg42
+            .atoms()
+            .find(|a| a.name() == "CB")
+            .expect("ARG42 should have a CB");
+        let arg_component = components.get("ARG").expect("ARG should be bundled");
+        let cb_ccd = arg_component
+            .atoms()
+            .iter()
+            .find(|a| a.atom_id() == "CB")
+            .expect("ARG's CCD entry should have a CB");
+        let bits = crate::typing::type_atom(cb_ccd, arg_component);
+
+        let interactions = classify_ring_atom(&geometry, cb.pos(), "C", "ARG", bits);
+        assert_eq!(
+            interactions,
+            vec![RingAtomInteraction::CarbonPi],
+            "expected only CARBONPI between PHE4's ring and ARG42 CB, got {interactions:?}"
+        );
+    }
+
+    #[test]
+    fn a_real_cation_pi_and_donor_pi_contact_is_found_in_bpti() {
+        // TYR10's ring sits close to LYS41's real, fully protonated NZ
+        // (NH3+) -- positively ionisable *and* a real donor, so both
+        // CATIONPI and DONORPI should fire for the same atom.
+        let (pdb, _errors) =
+            pdbtbx::open("tests/fixtures/structures/5PTI.cif").expect("BPTI should load");
+        let components = common_components();
+
+        let ring = bpti_ring("TYR", &components);
+        let tyr10 = bpti_residue(&pdb, 10, "TYR");
+        let geometry = ring_geometry(&ring, tyr10).expect("TYR10's ring should resolve");
+
+        let lys41 = bpti_residue(&pdb, 41, "LYS");
+        let nz = lys41
+            .atoms()
+            .find(|a| a.name() == "NZ")
+            .expect("LYS41 should have an NZ");
+        let lys_component = components.get("LYS").expect("LYS should be bundled");
+        let nz_ccd = lys_component
+            .atoms()
+            .iter()
+            .find(|a| a.atom_id() == "NZ")
+            .expect("LYS's CCD entry should have an NZ");
+        let bits = crate::typing::type_atom(nz_ccd, lys_component);
+
+        let interactions = classify_ring_atom(&geometry, nz.pos(), "N", "LYS", bits);
+        assert!(interactions.contains(&RingAtomInteraction::CationPi));
+        assert!(interactions.contains(&RingAtomInteraction::DonorPi));
+    }
+
+    #[test]
+    fn a_real_met_sulphur_pi_contact_is_found_in_bpti() {
+        // TYR23's ring sits within the wider 6A sulfur-specific cutoff of
+        // MET52's real SD -- the one ring-atom interaction that isn't
+        // gated by the tighter 4.5A/30-degree "near the face" check at
+        // all.
+        let (pdb, _errors) =
+            pdbtbx::open("tests/fixtures/structures/5PTI.cif").expect("BPTI should load");
+        let components = common_components();
+
+        let ring = bpti_ring("TYR", &components);
+        let tyr23 = bpti_residue(&pdb, 23, "TYR");
+        let geometry = ring_geometry(&ring, tyr23).expect("TYR23's ring should resolve");
+
+        let met52 = bpti_residue(&pdb, 52, "MET");
+        let sd = met52
+            .atoms()
+            .find(|a| a.name() == "SD")
+            .expect("MET52 should have an SD");
+        let met_component = components.get("MET").expect("MET should be bundled");
+        let sd_ccd = met_component
+            .atoms()
+            .iter()
+            .find(|a| a.atom_id() == "SD")
+            .expect("MET's CCD entry should have an SD");
+        let bits = crate::typing::type_atom(sd_ccd, met_component);
+
+        let interactions = classify_ring_atom(&geometry, sd.pos(), "S", "MET", bits);
+        assert_eq!(interactions, vec![RingAtomInteraction::MetSulphurPi]);
+    }
+
+    #[test]
+    fn an_aromatic_atom_never_gets_a_ring_atom_interaction() {
+        // The explicit "no aromatic atom-ring interactions" guard: even an
+        // atom that would otherwise satisfy e.g. DONORPI/CARBONPI
+        // shouldn't fire if it's itself typed aromatic (it belongs to its
+        // own ring's plane-plane classification instead).
+        let geometry = RingGeometry {
+            center: (0.0, 0.0, 0.0),
+            normal: (0.0, 0.0, 1.0),
+        };
+
+        let interactions = classify_ring_atom(
+            &geometry,
+            (1.0, 0.0, 0.0),
+            "C",
+            "PHE",
+            AtomTypeBits::AROMATIC | AtomTypeBits::WEAK_HBOND_DONOR,
+        );
+        assert!(interactions.is_empty());
     }
 }
