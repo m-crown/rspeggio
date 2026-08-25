@@ -33,6 +33,7 @@ use crate::typing::{type_atom, AtomTypeBits};
 use pdbtbx::{
     Atom, AtomConformerResidueChainModel, ContainsAtomConformer, ContainsAtomConformerResidue, PDB,
 };
+use rayon::prelude::*;
 use rspeggio_ccd::component::CcdComponent;
 use std::collections::HashMap;
 
@@ -121,6 +122,17 @@ fn match_feature(potential: FeatureBits, actual: FeatureBits, bit: FeatureBits) 
     }
 }
 
+// A real atom's identity, usable as a hash key across thread boundaries
+// (same rationale as `selection.rs`'s own `AtomKey`/`atom_key`: a bare
+// `*const Atom` is neither `Send` nor `Sync`, which M8's rayon
+// parallelism needs; its address as a plain `usize` carries the same
+// identity and is thread-safe).
+type AtomKey = usize;
+
+fn atom_key(atom: &Atom) -> AtomKey {
+    atom as *const Atom as usize
+}
+
 // One real atom's potential-vs-actual feature capability, across every
 // real contact it participates in anywhere in the structure.
 pub struct AtomSiftMatch<'a> {
@@ -159,39 +171,64 @@ impl AtomSiftMatch<'_> {
 // `CcdComponent` -- consistent with decision 03 (unknown components fail
 // loudly): a real atom's `potential` capability genuinely can't be
 // computed without its CCD typing.
+// M8: the two expensive independent-per-item steps (seeding every real
+// atom's `potential` typing, and classifying every real contact's
+// `actual` features -- the latter includes `hydrogenate`'s analytic
+// placement work, the priciest part of `classify_features`) each run
+// across a rayon thread pool. The final merge -- accumulating each
+// contact's features into its two participating atoms' entries -- stays
+// sequential: it's a reduction into one shared `HashMap`, cheap (just
+// OR-ing a few bits) compared to the classification work that feeds it,
+// so parallelizing it too wouldn't be worth the added complexity of a
+// concurrent map or a fold/merge scheme.
 pub fn compute_atom_sift_matches<'a>(
     pdb: &'a PDB,
     components: &'a HashMap<String, CcdComponent>,
 ) -> Result<Vec<AtomSiftMatch<'a>>, String> {
-    let mut matches: HashMap<*const Atom, AtomSiftMatch<'a>> = HashMap::new();
+    let atoms: Vec<_> = pdb.atoms_with_hierarchy().collect();
+    let seeds: Vec<(AtomKey, AtomSiftMatch<'a>)> = atoms
+        .into_par_iter()
+        .map(|hierarchy| {
+            let joined = join_atom(hierarchy.clone(), components);
+            let (Some(ccd_atom), Some(component)) = (joined.ccd_atom, joined.component) else {
+                let comp_id = hierarchy.residue().name().unwrap_or_default();
+                return Err(format!("unknown CCD component: {comp_id}"));
+            };
+            let bits = type_atom(ccd_atom, component);
+            let potential = potential_features(bits, ccd_atom.element());
+            Ok((
+                atom_key(hierarchy.atom()),
+                AtomSiftMatch {
+                    hierarchy,
+                    potential,
+                    actual: FeatureBits::empty(),
+                },
+            ))
+        })
+        .collect::<Result<_, String>>()?;
+    let mut matches: HashMap<AtomKey, AtomSiftMatch<'a>> = seeds.into_iter().collect();
 
-    for hierarchy in pdb.atoms_with_hierarchy() {
-        let joined = join_atom(hierarchy.clone(), components);
-        let (Some(ccd_atom), Some(component)) = (joined.ccd_atom, joined.component) else {
-            let comp_id = hierarchy.residue().name().unwrap_or_default();
-            return Err(format!("unknown CCD component: {comp_id}"));
-        };
-        let bits = type_atom(ccd_atom, component);
-        let potential = potential_features(bits, ccd_atom.element());
-        matches.insert(
-            hierarchy.atom() as *const Atom,
-            AtomSiftMatch {
-                hierarchy,
-                potential,
-                actual: FeatureBits::empty(),
-            },
-        );
-    }
+    let contacts = find_contacts(pdb, config::CONTACT_TYPES_MAX_DIST);
+    let classified: Vec<(AtomKey, AtomKey, FeatureBits)> = contacts
+        .par_iter()
+        .map(|contact| {
+            let features = classify_features(contact, components);
+            (
+                atom_key(contact.atom_1.atom()),
+                atom_key(contact.atom_2.atom()),
+                features,
+            )
+        })
+        .collect();
 
-    for contact in find_contacts(pdb, config::CONTACT_TYPES_MAX_DIST) {
-        let features = classify_features(&contact, components);
+    for (ptr_1, ptr_2, features) in classified {
         if features.is_empty() {
             continue;
         }
-        if let Some(entry) = matches.get_mut(&(contact.atom_1.atom() as *const Atom)) {
+        if let Some(entry) = matches.get_mut(&ptr_1) {
             entry.actual |= features;
         }
-        if let Some(entry) = matches.get_mut(&(contact.atom_2.atom() as *const Atom)) {
+        if let Some(entry) = matches.get_mut(&ptr_2) {
             entry.actual |= features;
         }
     }

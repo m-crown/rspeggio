@@ -251,6 +251,7 @@ version = "0.1.0"
 dependencies = [
  "bitflags",
  "pdbtbx",
+ "rayon",
  "rspeggio-ccd",
  "serde",
  "serde_json",

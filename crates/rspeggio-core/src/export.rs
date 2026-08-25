@@ -54,6 +54,7 @@ use pdbtbx::{
     AtomConformerResidueChainModel, ContainsAtomConformer, ContainsAtomConformerResidue,
     ContainsAtomConformerResidueChain, Residue, PDB,
 };
+use rayon::prelude::*;
 use rspeggio_ccd::component::{CcdComponent, ComponentType};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -304,7 +305,7 @@ pub fn export_atom_atom_contacts(
     selection: &crate::selection::SelectionContext,
 ) -> Result<Vec<AtomAtomContactJson>, String> {
     find_contacts(pdb, config::CONTACT_TYPES_MAX_DIST)
-        .iter()
+        .par_iter()
         .filter(|c| {
             selection.selection_plus.contains(c.atom_1.atom())
                 && selection.selection_plus.contains(c.atom_2.atom())
@@ -484,42 +485,47 @@ pub fn export_plane_plane_contacts(
                 .contains_any_atom_of(r.hierarchy.residue())
         })
         .collect();
-    let mut entries = Vec::new();
+    // M8: the O(n^2) ring-pair scan is the expensive part here (real
+    // structures can have hundreds of real rings once nucleotide bases and
+    // ligands are counted) -- each pair's classification is fully
+    // independent of every other, so the outer index runs across a rayon
+    // thread pool, same drop-in-parallel shape as `find_contacts`.
+    (0..ring_instances.len())
+        .into_par_iter()
+        .flat_map_iter(|i| {
+            let ring_instances = &ring_instances;
+            let selection = &selection;
+            ((i + 1)..ring_instances.len()).filter_map(move |j| {
+                let a = &ring_instances[i];
+                let b = &ring_instances[j];
+                let (distance, kind) = rings::classify_ring_ring(&a.geometry, &b.geometry)?;
+                let intra_residue = std::ptr::eq(a.hierarchy.residue(), b.hierarchy.residue());
+                if intra_residue && kind == RingRingInteraction::Ee {
+                    return None;
+                }
 
-    for i in 0..ring_instances.len() {
-        for j in (i + 1)..ring_instances.len() {
-            let a = &ring_instances[i];
-            let b = &ring_instances[j];
-            let Some((distance, kind)) = rings::classify_ring_ring(&a.geometry, &b.geometry) else {
-                continue;
-            };
-            let intra_residue = std::ptr::eq(a.hierarchy.residue(), b.hierarchy.residue());
-            if intra_residue && kind == RingRingInteraction::Ee {
-                continue;
-            }
+                let interacting_entities = interacting_entities_group(
+                    selection
+                        .selection
+                        .contains_any_atom_of(a.hierarchy.residue()),
+                    selection
+                        .selection
+                        .contains_any_atom_of(b.hierarchy.residue()),
+                    true,
+                    true,
+                );
 
-            let interacting_entities = interacting_entities_group(
-                selection
-                    .selection
-                    .contains_any_atom_of(a.hierarchy.residue()),
-                selection
-                    .selection
-                    .contains_any_atom_of(b.hierarchy.residue()),
-                true,
-                true,
-            );
-
-            entries.push(PlanePlaneContactJson {
-                bgn: group_identity(&a.hierarchy, a.component, &a.ring.atom_ids),
-                end: group_identity(&b.hierarchy, b.component, &b.ring.atom_ids),
-                entry_type: "plane-plane",
-                distance: round_2(distance),
-                contact: vec![ring_ring_label(kind)],
-                interacting_entities,
-            });
-        }
-    }
-    entries
+                Some(PlanePlaneContactJson {
+                    bgn: group_identity(&a.hierarchy, a.component, &a.ring.atom_ids),
+                    end: group_identity(&b.hierarchy, b.component, &b.ring.atom_ids),
+                    entry_type: "plane-plane",
+                    distance: round_2(distance),
+                    contact: vec![ring_ring_label(kind)],
+                    interacting_entities,
+                })
+            })
+        })
+        .collect()
 }
 
 // Real pdbe-arpeggio's atom-plane (ring-atom, `__calculate_atom_plane_contacts`):
@@ -544,58 +550,67 @@ pub fn export_atom_plane_contacts(
                 .contains_any_atom_of(r.hierarchy.residue())
         })
         .collect();
-    let mut entries = Vec::new();
+    // M8: parallelized over real atoms rather than rings -- there are
+    // typically far more real atoms than real rings in a structure, so
+    // this axis balances better across a thread pool. `join_atom`/
+    // `type_atom` don't depend on which ring is being checked, so they're
+    // computed once per atom up front (also fixes a real inefficiency the
+    // original nested-loop version had: calling them once per (ring,
+    // atom) pair instead of once per atom).
+    let atoms: Vec<_> = pdb.atoms_with_hierarchy().collect();
 
-    for ring in &ring_instances {
-        for hierarchy in pdb.atoms_with_hierarchy() {
-            if hierarchy.atom().element().map(|e| e.symbol()) == Some("H") {
-                continue;
-            }
-            if !selection.selection_plus.contains(hierarchy.atom()) {
-                continue;
-            }
+    atoms
+        .into_par_iter()
+        .filter(|h| h.atom().element().map(|e| e.symbol()) != Some("H"))
+        .filter(|h| selection.selection_plus.contains(h.atom()))
+        .filter_map(|hierarchy| {
             let joined = crate::join::join_atom(hierarchy.clone(), components);
             let (Some(ccd_atom), Some(atom_component)) = (joined.ccd_atom, joined.component) else {
-                continue;
+                return None;
             };
+            Some((hierarchy, ccd_atom, atom_component))
+        })
+        .flat_map_iter(|(hierarchy, ccd_atom, atom_component)| {
+            let ring_instances = &ring_instances;
+            let selection = &selection;
             let bits = crate::typing::type_atom(ccd_atom, atom_component);
+            ring_instances.iter().filter_map(move |ring| {
+                let interactions = rings::classify_ring_atom(
+                    &ring.geometry,
+                    hierarchy.atom().pos(),
+                    ccd_atom.element(),
+                    hierarchy.residue().name().unwrap_or_default(),
+                    bits,
+                );
+                if interactions.is_empty() {
+                    return None;
+                }
+                let mut labels: Vec<&'static str> =
+                    interactions.iter().map(|i| ring_atom_label(*i)).collect();
+                labels.sort_unstable();
 
-            let interactions = rings::classify_ring_atom(
-                &ring.geometry,
-                hierarchy.atom().pos(),
-                ccd_atom.element(),
-                hierarchy.residue().name().unwrap_or_default(),
-                bits,
-            );
-            if interactions.is_empty() {
-                continue;
-            }
-            let mut labels: Vec<&'static str> =
-                interactions.iter().map(|i| ring_atom_label(*i)).collect();
-            labels.sort_unstable();
+                let distance = euclidean_distance(hierarchy.atom().pos(), ring.geometry.center);
 
-            let distance = euclidean_distance(hierarchy.atom().pos(), ring.geometry.center);
+                let interacting_entities = interacting_entities_group(
+                    selection.selection.contains(hierarchy.atom()),
+                    selection
+                        .selection
+                        .contains_any_atom_of(ring.hierarchy.residue()),
+                    true,
+                    true,
+                );
 
-            let interacting_entities = interacting_entities_group(
-                selection.selection.contains(hierarchy.atom()),
-                selection
-                    .selection
-                    .contains_any_atom_of(ring.hierarchy.residue()),
-                true,
-                true,
-            );
-
-            entries.push(AtomPlaneContactJson {
-                bgn: atom_identity(&hierarchy, atom_component),
-                end: group_identity(&ring.hierarchy, ring.component, &ring.ring.atom_ids),
-                entry_type: "atom-plane",
-                distance: round_2(distance),
-                contact: labels,
-                interacting_entities,
-            });
-        }
-    }
-    entries
+                Some(AtomPlaneContactJson {
+                    bgn: atom_identity(&hierarchy, atom_component),
+                    end: group_identity(&ring.hierarchy, ring.component, &ring.ring.atom_ids),
+                    entry_type: "atom-plane",
+                    distance: round_2(distance),
+                    contact: labels,
+                    interacting_entities,
+                })
+            })
+        })
+        .collect()
 }
 
 // Real pdbe-arpeggio's group-group (amide-amide, `__calculate_group_group_contacts`):
@@ -614,36 +629,41 @@ pub fn export_group_group_contacts(
                 .contains_any_atom_of(a.hierarchy.residue())
         })
         .collect();
-    let mut entries = Vec::new();
-
-    for i in 0..amide_instances.len() {
-        for j in (i + 1)..amide_instances.len() {
-            let a = &amide_instances[i];
-            let b = &amide_instances[j];
-            let Some(distance) = rings::classify_amide_amide(&a.geometry, &b.geometry) else {
-                continue;
-            };
-            let interacting_entities = interacting_entities_group(
-                selection
-                    .selection
-                    .contains_any_atom_of(a.hierarchy.residue()),
-                selection
-                    .selection
-                    .contains_any_atom_of(b.hierarchy.residue()),
-                true,
-                true,
-            );
-            entries.push(PlanePlaneContactJson {
-                bgn: group_identity(&a.hierarchy, a.component, &amide_member_ids(&a.amide)),
-                end: group_identity(&b.hierarchy, b.component, &amide_member_ids(&b.amide)),
-                entry_type: "group-group",
-                distance: round_2(distance),
-                contact: vec!["AMIDEAMIDE"],
-                interacting_entities,
-            });
-        }
-    }
-    entries
+    // M8: same drop-in parallel shape as `export_plane_plane_contacts` --
+    // amide instances are typically few, so this particular O(n^2) scan
+    // is rarely a real hotspot, but the pattern stays uniform across every
+    // pairwise export function rather than parallelizing some and not
+    // others.
+    (0..amide_instances.len())
+        .into_par_iter()
+        .flat_map_iter(|i| {
+            let amide_instances = &amide_instances;
+            let selection = &selection;
+            ((i + 1)..amide_instances.len()).filter_map(move |j| {
+                let a = &amide_instances[i];
+                let b = &amide_instances[j];
+                let distance = rings::classify_amide_amide(&a.geometry, &b.geometry)?;
+                let interacting_entities = interacting_entities_group(
+                    selection
+                        .selection
+                        .contains_any_atom_of(a.hierarchy.residue()),
+                    selection
+                        .selection
+                        .contains_any_atom_of(b.hierarchy.residue()),
+                    true,
+                    true,
+                );
+                Some(PlanePlaneContactJson {
+                    bgn: group_identity(&a.hierarchy, a.component, &amide_member_ids(&a.amide)),
+                    end: group_identity(&b.hierarchy, b.component, &amide_member_ids(&b.amide)),
+                    entry_type: "group-group",
+                    distance: round_2(distance),
+                    contact: vec!["AMIDEAMIDE"],
+                    interacting_entities,
+                })
+            })
+        })
+        .collect()
 }
 
 // Real pdbe-arpeggio's group-plane (amide-ring, `__calculate_group_plane_contacts`):
@@ -671,38 +691,40 @@ pub fn export_group_plane_contacts(
                 .contains_any_atom_of(r.hierarchy.residue())
         })
         .collect();
-    let mut entries = Vec::new();
-
-    for amide in &amide_instances {
-        for ring in &ring_instances {
-            let Some(distance) = rings::classify_amide_ring(&amide.geometry, &ring.geometry) else {
-                continue;
-            };
-            let interacting_entities = interacting_entities_group(
-                selection
-                    .selection
-                    .contains_any_atom_of(amide.hierarchy.residue()),
-                selection
-                    .selection
-                    .contains_any_atom_of(ring.hierarchy.residue()),
-                true,
-                true,
-            );
-            entries.push(PlanePlaneContactJson {
-                bgn: group_identity(
-                    &amide.hierarchy,
-                    amide.component,
-                    &amide_member_ids(&amide.amide),
-                ),
-                end: group_identity(&ring.hierarchy, ring.component, &ring.ring.atom_ids),
-                entry_type: "group-plane",
-                distance: round_2(distance),
-                contact: vec!["AMIDERING"],
-                interacting_entities,
-            });
-        }
-    }
-    entries
+    // M8: parallelized over amides (usually the smaller of the two axes)
+    // with rings inner.
+    amide_instances
+        .par_iter()
+        .flat_map_iter(|amide| {
+            let ring_instances = &ring_instances;
+            let selection = &selection;
+            ring_instances.iter().filter_map(move |ring| {
+                let distance = rings::classify_amide_ring(&amide.geometry, &ring.geometry)?;
+                let interacting_entities = interacting_entities_group(
+                    selection
+                        .selection
+                        .contains_any_atom_of(amide.hierarchy.residue()),
+                    selection
+                        .selection
+                        .contains_any_atom_of(ring.hierarchy.residue()),
+                    true,
+                    true,
+                );
+                Some(PlanePlaneContactJson {
+                    bgn: group_identity(
+                        &amide.hierarchy,
+                        amide.component,
+                        &amide_member_ids(&amide.amide),
+                    ),
+                    end: group_identity(&ring.hierarchy, ring.component, &ring.ring.atom_ids),
+                    entry_type: "group-plane",
+                    distance: round_2(distance),
+                    contact: vec!["AMIDERING"],
+                    interacting_entities,
+                })
+            })
+        })
+        .collect()
 }
 
 // Every contact of every type this module can export, combined into one

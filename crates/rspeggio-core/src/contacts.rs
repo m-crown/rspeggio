@@ -19,6 +19,7 @@ use pdbtbx::{
     Atom, ContainsAtomConformer, ContainsAtomConformerResidue, ContainsAtomConformerResidueChain,
     PDB,
 };
+use rayon::prelude::*;
 
 pub fn euclidean_distance(a: (f64, f64, f64), b: (f64, f64, f64)) -> f64 {
     ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2) + (a.2 - b.2).powi(2)).sqrt()
@@ -126,45 +127,53 @@ pub struct Contact<'a> {
 // already guaranteed unique within a model); intra-residue pairs are
 // skipped (compared by residue identity, i.e. pointer equality into the
 // same live PDB); sequence-adjacent residue pairs are skipped by default.
+//
+// M8: the outer loop (one independent neighbor search per real atom, no
+// shared mutable state between iterations) runs across a rayon thread
+// pool -- `.collect()` on a rayon `ParallelIterator` still yields results
+// in the same order a sequential run would (rayon's own documented
+// guarantee), so this is a drop-in parallel replacement, not a behavior
+// change: every existing test (which all check *membership*, "is this
+// specific real contact present", never a specific index) keeps passing
+// unmodified.
 pub fn find_contacts(pdb: &PDB, cutoff: f64) -> Vec<Contact<'_>> {
     let tree = pdb.create_hierarchy_rtree();
     let cutoff_squared = cutoff * cutoff;
-    let mut contacts = Vec::new();
+    let atoms: Vec<_> = tree.iter().collect();
 
-    for atom in tree.iter() {
-        if element_symbol(atom.atom()) == "H" {
-            continue;
-        }
+    atoms
+        .into_par_iter()
+        .filter(|atom| element_symbol(atom.atom()) != "H")
+        .flat_map_iter(|atom| {
+            tree.locate_within_distance(atom.atom().pos(), cutoff_squared)
+                .filter_map(move |neighbor| {
+                    if element_symbol(neighbor.atom()) == "H" {
+                        return None;
+                    }
+                    if neighbor.atom().serial_number() <= atom.atom().serial_number() {
+                        return None; // each unordered pair considered once
+                    }
+                    if std::ptr::eq(atom.residue(), neighbor.residue()) {
+                        return None; // intra-residue
+                    }
+                    if is_sequence_adjacent(atom, neighbor) {
+                        return None;
+                    }
 
-        for neighbor in tree.locate_within_distance(atom.atom().pos(), cutoff_squared) {
-            if element_symbol(neighbor.atom()) == "H" {
-                continue;
-            }
-            if neighbor.atom().serial_number() <= atom.atom().serial_number() {
-                continue; // each unordered pair considered once
-            }
-            if std::ptr::eq(atom.residue(), neighbor.residue()) {
-                continue; // intra-residue
-            }
-            if is_sequence_adjacent(atom, neighbor) {
-                continue;
-            }
-
-            let distance = euclidean_distance(atom.atom().pos(), neighbor.atom().pos());
-            contacts.push(Contact {
-                atom_1: atom.clone(),
-                atom_2: neighbor.clone(),
-                distance,
-                category: classify_distance(
-                    element_symbol(atom.atom()),
-                    element_symbol(neighbor.atom()),
-                    distance,
-                ),
-            });
-        }
-    }
-
-    contacts
+                    let distance = euclidean_distance(atom.atom().pos(), neighbor.atom().pos());
+                    Some(Contact {
+                        atom_1: atom.clone(),
+                        atom_2: neighbor.clone(),
+                        distance,
+                        category: classify_distance(
+                            element_symbol(atom.atom()),
+                            element_symbol(neighbor.atom()),
+                            distance,
+                        ),
+                    })
+                })
+        })
+        .collect()
 }
 
 #[cfg(test)]

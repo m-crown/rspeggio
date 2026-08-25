@@ -158,23 +158,34 @@ fn matches_spec(spec: &SelectionSpec, hierarchy: &AtomConformerResidueChainModel
     }
 }
 
+// A real atom's identity, usable as a hash key across thread boundaries.
+// Real atom identity is still by pointer into the live `PDB` (same
+// technique the rest of this crate already uses for residue/ring dedup,
+// e.g. `export.rs`'s `residue_instances`) -- but a bare `*const Atom`
+// itself is neither `Send` nor `Sync`, which M8's rayon parallelism needs
+// to move these across threads. The pointer's own address, as a `usize`,
+// carries the same identity and is a plain, thread-safe integer.
+type AtomKey = usize;
+
+fn atom_key(atom: &Atom) -> AtomKey {
+    atom as *const Atom as usize
+}
+
 // A real, resolved set of atoms -- either an explicit user selection or
-// its binding-site expansion. Membership is by real atom identity (pointer
-// into the live `PDB`), same technique the rest of this crate already uses
-// for residue/ring dedup (`export.rs`'s `residue_instances`).
+// its binding-site expansion.
 pub struct Selection {
-    atoms: HashSet<*const Atom>,
+    atoms: HashSet<AtomKey>,
 }
 
 impl Selection {
-    fn from_atom_ptrs(atoms: HashSet<*const Atom>) -> Self {
+    fn from_atom_keys(atoms: HashSet<AtomKey>) -> Self {
         Self { atoms }
     }
 
     pub fn whole_structure(pdb: &PDB) -> Self {
-        Self::from_atom_ptrs(
+        Self::from_atom_keys(
             pdb.atoms_with_hierarchy()
-                .map(|h| h.atom() as *const Atom)
+                .map(|h| atom_key(h.atom()))
                 .collect(),
         )
     }
@@ -190,17 +201,17 @@ impl Selection {
         let mut atoms = HashSet::new();
         for hierarchy in pdb.atoms_with_hierarchy() {
             if parsed.iter().any(|spec| matches_spec(spec, &hierarchy)) {
-                atoms.insert(hierarchy.atom() as *const Atom);
+                atoms.insert(atom_key(hierarchy.atom()));
             }
         }
         if atoms.is_empty() {
             return Err("selection matched no real atoms".to_string());
         }
-        Ok(Self::from_atom_ptrs(atoms))
+        Ok(Self::from_atom_keys(atoms))
     }
 
     pub fn contains(&self, atom: &Atom) -> bool {
-        self.atoms.contains(&(atom as *const Atom))
+        self.atoms.contains(&atom_key(atom))
     }
 
     // Real ring-ring/atom-plane/group-group/group-plane membership checks
@@ -246,16 +257,16 @@ fn expand_to_binding_site(pdb: &PDB, selection: &Selection) -> Selection {
     let tree = pdb.create_hierarchy_rtree();
     let cutoff_squared = BINDING_SITE_EXPANSION_DISTANCE * BINDING_SITE_EXPANSION_DISTANCE;
 
-    let mut plus: HashSet<*const Atom> = selection.atoms.clone();
+    let mut plus: HashSet<AtomKey> = selection.atoms.clone();
     for hierarchy in tree.iter() {
         if !selection.contains(hierarchy.atom()) {
             continue;
         }
         for neighbor in tree.locate_within_distance(hierarchy.atom().pos(), cutoff_squared) {
-            plus.insert(neighbor.atom() as *const Atom);
+            plus.insert(atom_key(neighbor.atom()));
         }
     }
-    Selection::from_atom_ptrs(plus)
+    Selection::from_atom_keys(plus)
 }
 
 #[cfg(test)]
