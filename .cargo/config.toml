@@ -1,0 +1,15 @@
+# PyO3's own documented workaround for building/testing a `cdylib` with the
+# "extension-module" feature via plain `cargo build`/`cargo test` on macOS.
+# That feature deliberately *doesn't* link against libpython (a real Python
+# extension gets those symbols at import time from the interpreter that
+# loads it, not at link time) -- which is correct for the actual wheel
+# `maturin` produces, but means a bare `cargo build` otherwise fails with
+# "undefined symbols" for every Python C-API function pyo3 calls. Telling
+# the linker to defer symbol resolution to load time (same as `maturin`
+# itself does under the hood) fixes that for local `cargo build -p
+# rspeggio-py`/`cargo test -p rspeggio-py` without needing maturin at all.
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]

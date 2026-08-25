@@ -36,6 +36,34 @@ pub fn parse_ccd_component(contents: &str) -> Option<CcdComponent> {
     Some(CcdComponent::new(atoms, bonds, component_type))
 }
 
+// The component's own real comp_id (`_chem_comp.id`, e.g. `"ZN"`),
+// straight from the file's own content -- not to be confused with the
+// filename, which a caller-supplied CCD file (unlike this crate's own
+// bundled/fixture files, which are always named to match) has no
+// obligation to match at all. RCSB's own "ideal coordinates" downloads
+// are the concrete real case this matters for: `ZN_ideal.cif`'s real
+// `_chem_comp.id` is `"ZN"`, not `"ZN_ideal"`.
+pub fn parse_ccd_component_id(contents: &str) -> Option<String> {
+    let lines: Vec<&str> = contents.lines().collect();
+    let chem_comp_block = find_loop_block(&lines, "chem_comp")?;
+    let chem_comp_headers = parse_loop_headers(&chem_comp_block.header_refs(), "chem_comp");
+    let id_idx = *chem_comp_headers.get("id")?;
+    let row = chem_comp_block.data_refs();
+    let tokens = tokenize_cif_row(row.first()?);
+    tokens.get(id_idx).cloned()
+}
+
+// Loads a CCD file and returns it paired with its own real comp_id (see
+// `parse_ccd_component_id`) -- for callers (e.g. `rspeggio-py`) that can't
+// assume the filename matches the comp_id the way this crate's own
+// bundled/fixture files do.
+pub fn load_ccd_component_with_id(path: &str) -> Option<(String, CcdComponent)> {
+    let contents = load_ccd_file(path).ok()?;
+    let component = parse_ccd_component(&contents)?;
+    let comp_id = parse_ccd_component_id(&contents)?;
+    Some((comp_id, component))
+}
+
 // Loads and parses a CCD mmCIF file from disk in one step. `None` covers
 // both an unreadable file and a file that doesn't parse as a valid
 // component -- callers needing to distinguish the two should call
@@ -556,6 +584,18 @@ mod tests {
 
         assert_eq!(component.atoms().len(), 42);
         assert_eq!(component.bonds().len(), 44);
+    }
+
+    #[test]
+    fn a_real_ccd_files_own_id_can_diverge_from_its_filename() {
+        // ZN_ideal.cif's real _chem_comp.id is "ZN", not "ZN_ideal" -- the
+        // exact real RCSB "ideal coordinates" download naming convention
+        // that broke a filename-based comp_id guess in rspeggio-py's own
+        // integration testing before this function existed.
+        let (comp_id, component) = load_ccd_component_with_id("tests/fixtures/ZN_ideal.cif")
+            .expect("ZN fixture should load");
+        assert_eq!(comp_id, "ZN");
+        assert_eq!(component.atoms().len(), 1);
     }
 
     #[test]
