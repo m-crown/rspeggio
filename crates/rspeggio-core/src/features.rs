@@ -400,6 +400,38 @@ pub fn classify_features(
         features |= FeatureBits::WEAK_HBOND;
     }
 
+    // POLAR/WEAK_POLAR: real pdbe-arpeggio's angle-free companions to
+    // HBOND/WEAK_HBOND (`interactions.py:794/799/808/818/861/869/877` --
+    // `SIFt[13]`/`SIFt[14]`) -- donor/acceptor typing plus distance alone,
+    // regardless of whether the real angle geometry above actually
+    // confirmed a directional bond. Real arpeggio special-cases water here
+    // (its real per-atom SMARTS typing can't see missing H's), but this
+    // project's CCD-graph-based typing already gives water's oxygen both
+    // roles from its ideal bonded-H2O shape regardless of what the real
+    // structure resolves, so no special case is needed to get the same
+    // outcome.
+    if contact.distance <= config::HBOND.polar_distance
+        && either_order(
+            a1.bits,
+            a2.bits,
+            AtomTypeBits::HBOND_DONOR,
+            AtomTypeBits::HBOND_ACCEPTOR,
+        )
+    {
+        features |= FeatureBits::POLAR;
+    }
+
+    if contact.distance <= config::WEAK_HBOND.weak_polar_distance
+        && either_order(
+            a1.bits,
+            a2.bits,
+            AtomTypeBits::WEAK_HBOND_DONOR,
+            AtomTypeBits::WEAK_HBOND_ACCEPTOR,
+        )
+    {
+        features |= FeatureBits::WEAK_POLAR;
+    }
+
     // XBOND: real pdbe-arpeggio gates this on the same van-der-Waals
     // distance boundary `contacts::classify_distance` already computed for
     // `contact.category` (`distance <= sum_vdw_radii + vdw_comp`,
@@ -507,7 +539,68 @@ mod tests {
             if features.contains(FeatureBits::AROMATIC) {
                 assert!(c.distance <= config::AROMATIC.distance);
             }
+            if features.contains(FeatureBits::POLAR) {
+                assert!(c.distance <= config::HBOND.polar_distance);
+            }
+            if features.contains(FeatureBits::WEAK_POLAR) {
+                assert!(c.distance <= config::WEAK_HBOND.weak_polar_distance);
+            }
         }
+    }
+
+    #[test]
+    fn a_real_polar_contact_is_found_in_bpti() {
+        let (pdb, _errors) =
+            pdbtbx::open("tests/fixtures/structures/5PTI.cif").expect("BPTI should load");
+        let components = common_components();
+        let contacts = find_contacts(&pdb, config::CONTACT_TYPES_MAX_DIST);
+
+        let found = contacts
+            .iter()
+            .any(|c| classify_features(c, &components).contains(FeatureBits::POLAR));
+        assert!(found, "expected at least one real polar contact in BPTI");
+    }
+
+    #[test]
+    fn a_real_weak_polar_contact_is_found_in_1ubq() {
+        let (pdb, _errors) =
+            pdbtbx::open("../../tests/fixtures/structures/1UBQ.cif").expect("1UBQ should load");
+        let components = common_components();
+        let contacts = find_contacts(&pdb, config::CONTACT_TYPES_MAX_DIST);
+
+        let found = contacts
+            .iter()
+            .any(|c| classify_features(c, &components).contains(FeatureBits::WEAK_POLAR));
+        assert!(
+            found,
+            "expected at least one real weak polar contact in 1UBQ"
+        );
+    }
+
+    #[test]
+    fn a_real_hbond_contact_that_isnt_also_polar_is_a_genuine_real_divergence() {
+        // Not a bug: real pdbe-arpeggio has this exact same behavior.
+        // HBOND's own distance gate (3.9A) is looser than POLAR's
+        // `polar_distance` (3.5A) -- a real donor-H...acceptor pair whose
+        // angle geometry genuinely passes at, say, 3.7A is a real HBOND,
+        // but doesn't satisfy POLAR's tighter, angle-free distance check.
+        // Confirmed real (not merely theoretically possible): BPTI has
+        // both real HBOND-and-POLAR pairs and real HBOND-not-POLAR pairs
+        // side by side (11 of the latter, checked via an ad-hoc sweep
+        // before writing this test).
+        let (pdb, _errors) =
+            pdbtbx::open("tests/fixtures/structures/5PTI.cif").expect("BPTI should load");
+        let components = common_components();
+        let contacts = find_contacts(&pdb, config::CONTACT_TYPES_MAX_DIST);
+
+        let found = contacts.iter().any(|c| {
+            let features = classify_features(c, &components);
+            features.contains(FeatureBits::HBOND) && !features.contains(FeatureBits::POLAR)
+        });
+        assert!(
+            found,
+            "expected at least one real HBOND-but-not-POLAR contact in BPTI"
+        );
     }
 
     #[test]

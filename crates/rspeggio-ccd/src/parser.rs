@@ -1,6 +1,6 @@
 // crates/rspeggio-ccd/src/parser.rs
 
-use crate::component::{BondOrder, CcdAtom, CcdBond, CcdComponent};
+use crate::component::{BondOrder, CcdAtom, CcdBond, CcdComponent, ComponentType};
 use std::collections::HashMap;
 
 fn load_ccd_file(path: &str) -> Result<String, std::io::Error> {
@@ -29,7 +29,11 @@ pub fn parse_ccd_component(contents: &str) -> Option<CcdComponent> {
         None => Vec::new(),
     };
 
-    Some(CcdComponent::new(atoms, bonds))
+    let chem_comp_block = find_loop_block(&lines, "chem_comp")?;
+    let chem_comp_headers = parse_loop_headers(&chem_comp_block.header_refs(), "chem_comp");
+    let component_type = build_component_type(&chem_comp_headers, &chem_comp_block.data_refs())?;
+
+    Some(CcdComponent::new(atoms, bonds, component_type))
 }
 
 // Loads and parses a CCD mmCIF file from disk in one step. `None` covers
@@ -193,6 +197,20 @@ fn build_bonds(headers: &HashMap<String, usize>, data: &[&str]) -> Option<Vec<Cc
             Some(CcdBond::new(atom_id_1, atom_id_2, order, aromatic))
         })
         .collect()
+}
+
+// Resolves a component's `ComponentType` from its (always scalar --
+// `_chem_comp` describes exactly one component per file, never a `loop_`
+// of several) `_chem_comp.type`/`_chem_comp.name` row. `None` if either
+// required field is missing, the row is short, or `_chem_comp.type` isn't
+// a value `ComponentType::from_chem_comp_type` recognizes -- same failure
+// posture as an unrecognized `value_order` in `build_bonds`.
+fn build_component_type(headers: &HashMap<String, usize>, data: &[&str]) -> Option<ComponentType> {
+    let type_idx = *headers.get("type")?;
+    let name_idx = *headers.get("name")?;
+    let row = data.first()?;
+    let tokens = tokenize_cif_row(row);
+    ComponentType::from_chem_comp_type(tokens.get(type_idx)?, tokens.get(name_idx)?)
 }
 
 // TODO: in the future this could be zero-copy borrowed return <Vec &str> but for now will copy
@@ -463,6 +481,46 @@ mod tests {
 
         assert_eq!(component.atoms().len(), 42);
         assert_eq!(component.bonds().len(), 44);
+        assert_eq!(
+            component.component_type().code(),
+            "B",
+            "ADP is a real non-polymer bound molecule, not water"
+        );
+    }
+
+    #[test]
+    fn a_real_amino_acid_component_type_is_polypeptide() {
+        let component = load_ccd_component("data/common/ALA.cif").expect("ALA should parse");
+        assert_eq!(component.component_type().code(), "P");
+    }
+
+    #[test]
+    fn a_real_dna_component_type_is_polydeoxyribonucleotide() {
+        let component = load_ccd_component("data/common/DA.cif").expect("DA should parse");
+        assert_eq!(component.component_type().code(), "D");
+    }
+
+    #[test]
+    fn a_real_rna_component_type_is_polyribonucleotide() {
+        let component = load_ccd_component("data/common/A.cif").expect("A should parse");
+        assert_eq!(component.component_type().code(), "R");
+    }
+
+    #[test]
+    fn waters_real_chem_comp_name_makes_it_water_not_a_bound_molecule() {
+        let component = load_ccd_component("data/common/HOH.cif").expect("HOH should parse");
+        assert_eq!(
+            component.component_type().code(),
+            "W",
+            "same NON-POLYMER chem_comp.type as any ligand -- only the real chem_comp.name distinguishes it"
+        );
+    }
+
+    #[test]
+    fn a_real_ion_is_a_non_polymer_bound_molecule_not_water() {
+        let component =
+            load_ccd_component("tests/fixtures/ZN_ideal.cif").expect("ZN fixture should parse");
+        assert_eq!(component.component_type().code(), "B");
     }
 
     #[test]

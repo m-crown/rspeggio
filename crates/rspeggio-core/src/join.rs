@@ -141,7 +141,11 @@ mod tests {
             .cloned()
             .collect();
         let bonds: Vec<_> = met.bonds().to_vec();
-        components.insert("MET".to_string(), CcdComponent::new(atoms, bonds));
+        let component_type = met.component_type();
+        components.insert(
+            "MET".to_string(),
+            CcdComponent::new(atoms, bonds, component_type),
+        );
 
         let joined = join_all(&pdb, &components);
 

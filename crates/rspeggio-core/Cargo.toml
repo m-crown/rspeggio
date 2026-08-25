@@ -7,3 +7,5 @@ edition = "2021"
 bitflags = "2"
 pdbtbx = { version = "0.12", features = ["rstar"] }
 rspeggio-ccd = { path = "../rspeggio-ccd" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
