@@ -268,11 +268,12 @@ fn build_atom_atom_entry(
     contact: &Contact,
     components: &HashMap<String, CcdComponent>,
     selection: &crate::selection::SelectionContext,
+    ph: f64,
 ) -> Result<AtomAtomContactJson, String> {
     let component_1 = component_for(&contact.atom_1, components)?;
     let component_2 = component_for(&contact.atom_2, components)?;
 
-    let features = classify_features(contact, components);
+    let features = classify_features(contact, components, ph);
     let interacting_entities = interacting_entities_atom_atom(
         &selection.selection,
         contact.atom_1.atom(),
@@ -303,6 +304,7 @@ pub fn export_atom_atom_contacts(
     pdb: &PDB,
     components: &HashMap<String, CcdComponent>,
     selection: &crate::selection::SelectionContext,
+    ph: f64,
 ) -> Result<Vec<AtomAtomContactJson>, String> {
     find_contacts(pdb, config::CONTACT_TYPES_MAX_DIST)
         .par_iter()
@@ -310,7 +312,7 @@ pub fn export_atom_atom_contacts(
             selection.selection_plus.contains(c.atom_1.atom())
                 && selection.selection_plus.contains(c.atom_2.atom())
         })
-        .map(|c| build_atom_atom_entry(c, components, selection))
+        .map(|c| build_atom_atom_entry(c, components, selection, ph))
         .collect()
 }
 
@@ -541,6 +543,7 @@ pub fn export_atom_plane_contacts(
     pdb: &PDB,
     components: &HashMap<String, CcdComponent>,
     selection: &crate::selection::SelectionContext,
+    ph: f64,
 ) -> Vec<AtomPlaneContactJson> {
     let ring_instances: Vec<_> = collect_ring_instances(pdb, components)
         .into_iter()
@@ -573,7 +576,7 @@ pub fn export_atom_plane_contacts(
         .flat_map_iter(|(hierarchy, ccd_atom, atom_component)| {
             let ring_instances = &ring_instances;
             let selection = &selection;
-            let bits = crate::typing::type_atom(ccd_atom, atom_component);
+            let bits = crate::typing::type_atom(ccd_atom, atom_component, ph);
             ring_instances.iter().filter_map(move |ring| {
                 let interactions = rings::classify_ring_atom(
                     &ring.geometry,
@@ -743,8 +746,9 @@ pub fn export_all_contacts(
     pdb: &PDB,
     components: &HashMap<String, CcdComponent>,
     selection: &crate::selection::SelectionContext,
+    ph: f64,
 ) -> Result<Vec<ContactJson>, String> {
-    let mut entries: Vec<ContactJson> = export_atom_atom_contacts(pdb, components, selection)?
+    let mut entries: Vec<ContactJson> = export_atom_atom_contacts(pdb, components, selection, ph)?
         .into_iter()
         .map(ContactJson::AtomAtom)
         .collect();
@@ -754,7 +758,7 @@ pub fn export_all_contacts(
             .map(ContactJson::Group),
     );
     entries.extend(
-        export_atom_plane_contacts(pdb, components, selection)
+        export_atom_plane_contacts(pdb, components, selection, ph)
             .into_iter()
             .map(ContactJson::AtomPlane),
     );
@@ -805,8 +809,13 @@ mod tests {
         components.insert("ZN".to_string(), zn);
         let selection = crate::selection::SelectionContext::whole_structure(&pdb);
 
-        let entries = export_atom_atom_contacts(&pdb, &components, &selection)
-            .expect("1CA2 is amino acids + water + zinc, all now known");
+        let entries = export_atom_atom_contacts(
+            &pdb,
+            &components,
+            &selection,
+            crate::typing::PHYSIOLOGICAL_PH,
+        )
+        .expect("1CA2 is amino acids + water + zinc, all now known");
 
         let entry = entries
             .iter()
@@ -850,8 +859,13 @@ mod tests {
         }
         let selection = crate::selection::SelectionContext::whole_structure(&pdb);
 
-        let entries = export_atom_atom_contacts(&pdb, &components, &selection)
-            .expect("1MBO is amino acids + water + heme + bound oxygen, all now known");
+        let entries = export_atom_atom_contacts(
+            &pdb,
+            &components,
+            &selection,
+            crate::typing::PHYSIOLOGICAL_PH,
+        )
+        .expect("1MBO is amino acids + water + heme + bound oxygen, all now known");
 
         let val68_cg1 = entries
             .iter()
@@ -871,8 +885,13 @@ mod tests {
         let components = common_components();
         let selection = crate::selection::SelectionContext::whole_structure(&pdb);
 
-        let entries =
-            export_atom_atom_contacts(&pdb, &components, &selection).expect("1UBQ should export");
+        let entries = export_atom_atom_contacts(
+            &pdb,
+            &components,
+            &selection,
+            crate::typing::PHYSIOLOGICAL_PH,
+        )
+        .expect("1UBQ should export");
 
         let found = entries.iter().any(|e| {
             e.bgn.label_comp_id == "HOH"
@@ -892,8 +911,13 @@ mod tests {
         let components = common_components();
         let selection = crate::selection::SelectionContext::whole_structure(&pdb);
 
-        let entries =
-            export_atom_atom_contacts(&pdb, &components, &selection).expect("1UBQ should export");
+        let entries = export_atom_atom_contacts(
+            &pdb,
+            &components,
+            &selection,
+            crate::typing::PHYSIOLOGICAL_PH,
+        )
+        .expect("1UBQ should export");
 
         let found = entries.iter().any(|e| {
             (e.bgn.label_comp_id == "HOH") != (e.end.label_comp_id == "HOH")
@@ -912,8 +936,13 @@ mod tests {
         let components = common_components();
         let selection = crate::selection::SelectionContext::whole_structure(&pdb);
 
-        let entries =
-            export_atom_atom_contacts(&pdb, &components, &selection).expect("1UBQ should export");
+        let entries = export_atom_atom_contacts(
+            &pdb,
+            &components,
+            &selection,
+            crate::typing::PHYSIOLOGICAL_PH,
+        )
+        .expect("1UBQ should export");
 
         let found = entries.iter().any(|e| {
             e.bgn.label_comp_id != "HOH"
@@ -933,8 +962,13 @@ mod tests {
         let components = common_components();
         let selection = crate::selection::SelectionContext::whole_structure(&pdb);
 
-        let entries =
-            export_atom_atom_contacts(&pdb, &components, &selection).expect("1UBQ should export");
+        let entries = export_atom_atom_contacts(
+            &pdb,
+            &components,
+            &selection,
+            crate::typing::PHYSIOLOGICAL_PH,
+        )
+        .expect("1UBQ should export");
         assert!(!entries.is_empty());
 
         const DISTANCE_LABELS: [&str; 5] = ["clash", "covalent", "vdw_clash", "vdw", "proximal"];
@@ -960,7 +994,13 @@ mod tests {
         let components: HashMap<String, CcdComponent> = HashMap::new();
         let selection = crate::selection::SelectionContext::whole_structure(&pdb);
 
-        assert!(export_atom_atom_contacts(&pdb, &components, &selection).is_err());
+        assert!(export_atom_atom_contacts(
+            &pdb,
+            &components,
+            &selection,
+            crate::typing::PHYSIOLOGICAL_PH
+        )
+        .is_err());
     }
 
     #[test]
@@ -970,8 +1010,13 @@ mod tests {
         let components = common_components();
         let selection = crate::selection::SelectionContext::whole_structure(&pdb);
 
-        let entries =
-            export_atom_atom_contacts(&pdb, &components, &selection).expect("1UBQ should export");
+        let entries = export_atom_atom_contacts(
+            &pdb,
+            &components,
+            &selection,
+            crate::typing::PHYSIOLOGICAL_PH,
+        )
+        .expect("1UBQ should export");
         let json = serde_json::to_value(&entries[0]).expect("should serialize");
 
         for field in [
@@ -1059,7 +1104,12 @@ mod tests {
         let components = common_components();
         let selection = crate::selection::SelectionContext::whole_structure(&pdb);
 
-        let entries = export_atom_plane_contacts(&pdb, &components, &selection);
+        let entries = export_atom_plane_contacts(
+            &pdb,
+            &components,
+            &selection,
+            crate::typing::PHYSIOLOGICAL_PH,
+        );
         let entry = entries
             .iter()
             .find(|e| {
@@ -1123,8 +1173,13 @@ mod tests {
         components.insert("ZN".to_string(), zn);
         let selection = crate::selection::SelectionContext::whole_structure(&pdb);
 
-        let entries =
-            export_all_contacts(&pdb, &components, &selection).expect("1CA2 should export");
+        let entries = export_all_contacts(
+            &pdb,
+            &components,
+            &selection,
+            crate::typing::PHYSIOLOGICAL_PH,
+        )
+        .expect("1CA2 should export");
 
         let mut seen_types: Vec<&str> = entries
             .iter()
@@ -1181,8 +1236,13 @@ mod tests {
         let selection =
             crate::selection::SelectionContext::from_specs(&pdb, &["RESNAME:ZN".to_string()])
                 .expect("ZN should be found in 1CA2");
-        let entries = export_atom_atom_contacts(&pdb, &components, &selection)
-            .expect("1CA2 is amino acids + water + zinc, all now known");
+        let entries = export_atom_atom_contacts(
+            &pdb,
+            &components,
+            &selection,
+            crate::typing::PHYSIOLOGICAL_PH,
+        )
+        .expect("1CA2 is amino acids + water + zinc, all now known");
 
         let glu_phe = entries
             .iter()
@@ -1241,8 +1301,13 @@ mod tests {
         let selection =
             crate::selection::SelectionContext::from_specs(&pdb, &["RESNAME:HEM".to_string()])
                 .expect("HEM should be found in 1MBO");
-        let entries = export_atom_atom_contacts(&pdb, &components, &selection)
-            .expect("1MBO is amino acids + water + heme + bound oxygen, all now known");
+        let entries = export_atom_atom_contacts(
+            &pdb,
+            &components,
+            &selection,
+            crate::typing::PHYSIOLOGICAL_PH,
+        )
+        .expect("1MBO is amino acids + water + heme + bound oxygen, all now known");
 
         let found_inter = entries.iter().any(|e| {
             let ids = [e.bgn.label_comp_id.as_str(), e.end.label_comp_id.as_str()];

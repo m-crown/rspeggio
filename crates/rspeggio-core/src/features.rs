@@ -50,10 +50,11 @@ struct TypedAtom<'a> {
 fn typed_atom<'a>(
     hierarchy: AtomConformerResidueChainModel<'a>,
     components: &'a HashMap<String, CcdComponent>,
+    ph: f64,
 ) -> TypedAtom<'a> {
     let joined = join_atom(hierarchy.clone(), components);
     let bits = match (joined.ccd_atom, joined.component) {
-        (Some(a), Some(c)) => typing::type_atom(a, c),
+        (Some(a), Some(c)) => typing::type_atom(a, c, ph),
         _ => AtomTypeBits::empty(),
     };
     TypedAtom {
@@ -317,13 +318,16 @@ fn classify_hbond_like(
     false
 }
 
-// Classifies every distance-and-typing feature contact for one atom pair.
+// Classifies every distance-and-typing feature contact for one atom pair,
+// at a given solution `ph` (see `typing::type_atom`'s own doc -- only the
+// carboxyl-donor rule actually consults it).
 pub fn classify_features(
     contact: &Contact,
     components: &HashMap<String, CcdComponent>,
+    ph: f64,
 ) -> FeatureBits {
-    let a1 = typed_atom(contact.atom_1.clone(), components);
-    let a2 = typed_atom(contact.atom_2.clone(), components);
+    let a1 = typed_atom(contact.atom_1.clone(), components, ph);
+    let a2 = typed_atom(contact.atom_2.clone(), components, ph);
 
     let mut features = FeatureBits::empty();
 
@@ -468,9 +472,10 @@ mod tests {
         let components = common_components();
         let contacts = find_contacts(&pdb, config::CONTACT_TYPES_MAX_DIST);
 
-        let found = contacts
-            .iter()
-            .any(|c| classify_features(c, &components).contains(FeatureBits::HYDROPHOBIC));
+        let found = contacts.iter().any(|c| {
+            classify_features(c, &components, typing::PHYSIOLOGICAL_PH)
+                .contains(FeatureBits::HYDROPHOBIC)
+        });
         assert!(
             found,
             "expected at least one hydrophobic contact in 1UBQ's core"
@@ -484,9 +489,10 @@ mod tests {
         let components = common_components();
         let contacts = find_contacts(&pdb, config::CONTACT_TYPES_MAX_DIST);
 
-        let found = contacts
-            .iter()
-            .any(|c| classify_features(c, &components).contains(FeatureBits::CARBONYL));
+        let found = contacts.iter().any(|c| {
+            classify_features(c, &components, typing::PHYSIOLOGICAL_PH)
+                .contains(FeatureBits::CARBONYL)
+        });
         assert!(
             found,
             "expected at least one backbone carbonyl-carbonyl contact in 1UBQ"
@@ -505,7 +511,7 @@ mod tests {
         );
 
         for c in &contacts {
-            assert!(classify_features(c, &components).is_empty());
+            assert!(classify_features(c, &components, typing::PHYSIOLOGICAL_PH).is_empty());
         }
     }
 
@@ -517,7 +523,7 @@ mod tests {
         let contacts = find_contacts(&pdb, config::CONTACT_TYPES_MAX_DIST);
 
         for c in &contacts {
-            let features = classify_features(c, &components);
+            let features = classify_features(c, &components, typing::PHYSIOLOGICAL_PH);
             if features.contains(FeatureBits::IONIC) {
                 assert!(c.distance <= config::IONIC.distance);
             }
@@ -555,9 +561,9 @@ mod tests {
         let components = common_components();
         let contacts = find_contacts(&pdb, config::CONTACT_TYPES_MAX_DIST);
 
-        let found = contacts
-            .iter()
-            .any(|c| classify_features(c, &components).contains(FeatureBits::POLAR));
+        let found = contacts.iter().any(|c| {
+            classify_features(c, &components, typing::PHYSIOLOGICAL_PH).contains(FeatureBits::POLAR)
+        });
         assert!(found, "expected at least one real polar contact in BPTI");
     }
 
@@ -568,9 +574,10 @@ mod tests {
         let components = common_components();
         let contacts = find_contacts(&pdb, config::CONTACT_TYPES_MAX_DIST);
 
-        let found = contacts
-            .iter()
-            .any(|c| classify_features(c, &components).contains(FeatureBits::WEAK_POLAR));
+        let found = contacts.iter().any(|c| {
+            classify_features(c, &components, typing::PHYSIOLOGICAL_PH)
+                .contains(FeatureBits::WEAK_POLAR)
+        });
         assert!(
             found,
             "expected at least one real weak polar contact in 1UBQ"
@@ -594,12 +601,62 @@ mod tests {
         let contacts = find_contacts(&pdb, config::CONTACT_TYPES_MAX_DIST);
 
         let found = contacts.iter().any(|c| {
-            let features = classify_features(c, &components);
+            let features = classify_features(c, &components, typing::PHYSIOLOGICAL_PH);
             features.contains(FeatureBits::HBOND) && !features.contains(FeatureBits::POLAR)
         });
         assert!(
             found,
             "expected at least one real HBOND-but-not-POLAR contact in BPTI"
+        );
+    }
+
+    #[test]
+    fn ph_genuinely_changes_a_real_contacts_classification() {
+        // GLU106 OE2 <-> ARG246 N in 1CA2, found via an ad-hoc sweep
+        // before writing this test: at physiological pH, GLU's side-chain
+        // carboxylate is deprotonated (per the carboxyl-pKa rule), so OE2
+        // is acceptor-only and the pair only clears the angle-free POLAR
+        // distance check. Below the carboxyl's ~4.0 pKa, OE2 becomes a
+        // real protonated donor too, opening a second (reversed) real
+        // donor-H...acceptor direction that genuinely passes the angle
+        // check -- so the same real geometry now also classifies as a
+        // real HBOND. This is the actual regression test for `ph` being
+        // threaded all the way through `classify_features`, not just
+        // `type_atom` in isolation.
+        let (pdb, _errors) =
+            pdbtbx::open("../../tests/fixtures/structures/1CA2.cif").expect("1CA2 should load");
+        let components = common_components();
+        let contacts = find_contacts(&pdb, config::CONTACT_TYPES_MAX_DIST);
+
+        let contact = contacts
+            .iter()
+            .find(|c| {
+                let is_glu_oe2 = |h: &pdbtbx::AtomConformerResidueChainModel| {
+                    h.residue().name() == Some("GLU")
+                        && h.residue().id().0 == 106
+                        && h.atom().name() == "OE2"
+                };
+                let is_arg_n = |h: &pdbtbx::AtomConformerResidueChainModel| {
+                    h.residue().name() == Some("ARG")
+                        && h.residue().id().0 == 246
+                        && h.atom().name() == "N"
+                };
+                (is_glu_oe2(&c.atom_1) && is_arg_n(&c.atom_2))
+                    || (is_arg_n(&c.atom_1) && is_glu_oe2(&c.atom_2))
+            })
+            .expect("GLU106 OE2 <-> ARG246 N should be a real contact in 1CA2");
+
+        let physiological = classify_features(contact, &components, typing::PHYSIOLOGICAL_PH);
+        assert!(physiological.contains(FeatureBits::POLAR));
+        assert!(
+            !physiological.contains(FeatureBits::HBOND),
+            "at physiological pH, GLU106's carboxylate should be deprotonated (acceptor only)"
+        );
+
+        let acidic = classify_features(contact, &components, 2.0);
+        assert!(
+            acidic.contains(FeatureBits::HBOND),
+            "at pH 2.0, GLU106 OE2 should be a real protonated donor, opening a real HBOND"
         );
     }
 
@@ -614,9 +671,10 @@ mod tests {
         let components = common_components();
         let contacts = find_contacts(&pdb, config::CONTACT_TYPES_MAX_DIST);
 
-        let found = contacts
-            .iter()
-            .any(|c| classify_features(c, &components).contains(FeatureBits::AROMATIC));
+        let found = contacts.iter().any(|c| {
+            classify_features(c, &components, typing::PHYSIOLOGICAL_PH)
+                .contains(FeatureBits::AROMATIC)
+        });
         assert!(found, "expected at least one real aromatic contact in 1CA2");
     }
 
@@ -640,9 +698,9 @@ mod tests {
         components.insert("8CL".to_string(), cl_component);
         let contacts = find_contacts(&pdb, config::CONTACT_TYPES_MAX_DIST);
 
-        let found = contacts
-            .iter()
-            .any(|c| classify_features(c, &components).contains(FeatureBits::XBOND));
+        let found = contacts.iter().any(|c| {
+            classify_features(c, &components, typing::PHYSIOLOGICAL_PH).contains(FeatureBits::XBOND)
+        });
         assert!(
             found,
             "expected at least one real halogen bond between 8CL's chlorine and a real acceptor in 3G4W"
@@ -660,9 +718,10 @@ mod tests {
         components.insert("ZN".to_string(), zn);
         let contacts = find_contacts(&pdb, config::CONTACT_TYPES_MAX_DIST);
 
-        let found = contacts
-            .iter()
-            .any(|c| classify_features(c, &components).contains(FeatureBits::METAL_COMPLEX));
+        let found = contacts.iter().any(|c| {
+            classify_features(c, &components, typing::PHYSIOLOGICAL_PH)
+                .contains(FeatureBits::METAL_COMPLEX)
+        });
         assert!(
             found,
             "expected at least one metal-complex contact around 1CA2's zinc"
@@ -676,9 +735,9 @@ mod tests {
         let components = common_components();
         let contacts = find_contacts(&pdb, config::CONTACT_TYPES_MAX_DIST);
 
-        let found = contacts
-            .iter()
-            .any(|c| classify_features(c, &components).contains(FeatureBits::IONIC));
+        let found = contacts.iter().any(|c| {
+            classify_features(c, &components, typing::PHYSIOLOGICAL_PH).contains(FeatureBits::IONIC)
+        });
         assert!(
             found,
             "expected at least one ionic (salt bridge) contact in 1CA2"
@@ -696,9 +755,9 @@ mod tests {
         let components = common_components();
         let contacts = find_contacts(&pdb, config::CONTACT_TYPES_MAX_DIST);
 
-        let found = contacts
-            .iter()
-            .any(|c| classify_features(c, &components).contains(FeatureBits::HBOND));
+        let found = contacts.iter().any(|c| {
+            classify_features(c, &components, typing::PHYSIOLOGICAL_PH).contains(FeatureBits::HBOND)
+        });
         assert!(found, "expected at least one real hbond in BPTI");
     }
 
@@ -709,9 +768,10 @@ mod tests {
         let components = common_components();
         let contacts = find_contacts(&pdb, config::CONTACT_TYPES_MAX_DIST);
 
-        let found = contacts
-            .iter()
-            .any(|c| classify_features(c, &components).contains(FeatureBits::WEAK_HBOND));
+        let found = contacts.iter().any(|c| {
+            classify_features(c, &components, typing::PHYSIOLOGICAL_PH)
+                .contains(FeatureBits::WEAK_HBOND)
+        });
         assert!(found, "expected at least one weak hbond (C-H...X) in 1UBQ");
     }
 }

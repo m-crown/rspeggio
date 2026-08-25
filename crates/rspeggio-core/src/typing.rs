@@ -138,7 +138,29 @@ fn is_neg_ionisable_oxygen(atom: &CcdAtom, component: &CcdComponent) -> bool {
         .any(|(n, _)| is_carboxyl_carbon(n, component))
 }
 
-pub fn type_atom(atom: &CcdAtom, component: &CcdComponent) -> AtomTypeBits {
+// Real pdbe-arpeggio's own default (`Arpeggio.__init__`'s `ph=7.4`
+// constructor argument, `interactions.py:37`).
+pub const PHYSIOLOGICAL_PH: f64 = 7.4;
+
+// A single representative pKa for a free/side-chain carboxylic acid group
+// (Asp/Glu side chains are ~3.9-4.3 in practice, a free C-terminus is
+// ~3.1-3.6) -- not a per-residue lookup table. This project's carboxyl
+// rule identifies the group structurally, not by name (see
+// `is_carboxyl_carbon`'s own doc), so it needs one representative
+// threshold to compare a caller's `ph` against, the same way the rule
+// itself is already a structural generalization rather than a full
+// per-atom pKa-prediction model (real OpenBabel's `AddHydrogens`, which
+// real arpeggio actually calls for this, does something more precise).
+pub const CARBOXYL_PKA: f64 = 4.0;
+
+// Classifies one atom's chemical role at a given solution `ph`. This is
+// still a property of the *component's chemistry graph* first and
+// foremost (see the module doc) -- `ph` only affects the one rule that's
+// genuinely pH-dependent (carboxyl-group protonation, see below); every
+// other rule is structural and ignores it entirely. Pass
+// `PHYSIOLOGICAL_PH` for the common case (what every version of this
+// function before pH-awareness assumed unconditionally).
+pub fn type_atom(atom: &CcdAtom, component: &CcdComponent, ph: f64) -> AtomTypeBits {
     let mut bits = AtomTypeBits::empty();
 
     if atom.aromatic() {
@@ -218,16 +240,19 @@ pub fn type_atom(atom: &CcdAtom, component: &CcdComponent) -> AtomTypeBits {
     if atom.element() == "O" || (atom.element() == "N" && bond_count <= 3 && !pos_ionisable) {
         bits |= AtomTypeBits::HBOND_ACCEPTOR;
     }
-    // A carboxyl group's hydroxyl oxygen is never a real donor, even when
-    // the CCD's static "ideal free molecule" entry happens to show an
-    // attached H (e.g. ASP/GLU's CCD form, or any residue's free-acid
-    // C-terminus). Carboxylic acid pKa is ~2-5, far below physiological
-    // pH (~7.4), so in solution the group is essentially always
-    // deprotonated regardless of what a single static structure encodes.
-    // This is a pH/pKa argument, not a per-residue exception: it applies
-    // to `neg_ionisable` generically, so it covers ASP, GLU, a real
-    // C-terminus, or any ligand's -COOH the same way.
-    let is_deprotonated_carboxyl_oxygen = atom.element() == "O" && neg_ionisable;
+    // A carboxyl group's hydroxyl oxygen is a real donor only when the
+    // solution is acidic enough to protonate it, regardless of what the
+    // CCD's static "ideal free molecule" entry happens to show (e.g.
+    // ASP/GLU's CCD form, or any residue's free-acid C-terminus, may
+    // encode an attached H even though the group is really deprotonated
+    // at the given `ph`). This is a pH/pKa argument, not a per-residue
+    // exception: it applies to `neg_ionisable` generically, so it covers
+    // ASP, GLU, a real C-terminus, or any ligand's -COOH the same way. At
+    // the default physiological `ph` (~7.4), well above carboxylic acid
+    // pKa (~2-5), this is essentially always deprotonated -- the same
+    // behavior this rule always had before `ph` became a real parameter.
+    let is_deprotonated_carboxyl_oxygen =
+        atom.element() == "O" && neg_ionisable && ph > CARBOXYL_PKA;
     if matches!(atom.element(), "N" | "O" | "S")
         && has_h_neighbor
         && !is_deprotonated_carboxyl_oxygen
@@ -291,7 +316,7 @@ mod tests {
             .find(|a| a.atom_id() == "CZ")
             .expect("PHE has a CZ ring atom");
 
-        let bits = type_atom(cz, phe);
+        let bits = type_atom(cz, phe, PHYSIOLOGICAL_PH);
 
         assert!(bits.contains(AtomTypeBits::AROMATIC));
         assert!(!bits.contains(AtomTypeBits::METAL));
@@ -308,7 +333,7 @@ mod tests {
             .find(|a| a.atom_id() == "N")
             .expect("PHE has a backbone N");
 
-        let bits = type_atom(n, phe);
+        let bits = type_atom(n, phe, PHYSIOLOGICAL_PH);
 
         assert!(!bits.contains(AtomTypeBits::AROMATIC));
     }
@@ -324,7 +349,7 @@ mod tests {
             .find(|a| a.atom_id() == "CA")
             .expect("the CA component has one atom named CA");
 
-        let bits = type_atom(ca_atom, ca_ion);
+        let bits = type_atom(ca_atom, ca_ion, PHYSIOLOGICAL_PH);
 
         assert!(bits.contains(AtomTypeBits::METAL));
         assert!(!bits.contains(AtomTypeBits::AROMATIC));
@@ -346,8 +371,8 @@ mod tests {
             .find(|a| a.atom_id() == "O")
             .expect("ALA has a backbone carbonyl O");
 
-        assert!(type_atom(c, ala).contains(AtomTypeBits::CARBONYL_CARBON));
-        assert!(type_atom(o, ala).contains(AtomTypeBits::CARBONYL_OXYGEN));
+        assert!(type_atom(c, ala, PHYSIOLOGICAL_PH).contains(AtomTypeBits::CARBONYL_CARBON));
+        assert!(type_atom(o, ala, PHYSIOLOGICAL_PH).contains(AtomTypeBits::CARBONYL_OXYGEN));
     }
 
     #[test]
@@ -363,7 +388,7 @@ mod tests {
             .find(|a| a.atom_id() == "OXT")
             .expect("ALA has an OXT in its free-acid CCD form");
 
-        let bits = type_atom(oxt, ala);
+        let bits = type_atom(oxt, ala, PHYSIOLOGICAL_PH);
 
         assert!(!bits.contains(AtomTypeBits::CARBONYL_OXYGEN));
         assert!(!bits.contains(AtomTypeBits::CARBONYL_CARBON));
@@ -382,7 +407,7 @@ mod tests {
             .find(|a| a.atom_id() == "CA")
             .expect("ALA has a CA");
 
-        assert!(!type_atom(ca, ala).contains(AtomTypeBits::CARBONYL_CARBON));
+        assert!(!type_atom(ca, ala, PHYSIOLOGICAL_PH).contains(AtomTypeBits::CARBONYL_CARBON));
     }
 
     #[test]
@@ -397,7 +422,7 @@ mod tests {
             .find(|a| a.atom_id() == "CB")
             .expect("ALA has a CB");
 
-        assert!(type_atom(cb, ala).contains(AtomTypeBits::HYDROPHOBE));
+        assert!(type_atom(cb, ala, PHYSIOLOGICAL_PH).contains(AtomTypeBits::HYDROPHOBE));
     }
 
     #[test]
@@ -412,7 +437,7 @@ mod tests {
             .find(|a| a.atom_id() == "CA")
             .expect("ALA has a CA");
 
-        assert!(!type_atom(ca, ala).contains(AtomTypeBits::HYDROPHOBE));
+        assert!(!type_atom(ca, ala, PHYSIOLOGICAL_PH).contains(AtomTypeBits::HYDROPHOBE));
     }
 
     #[test]
@@ -426,7 +451,7 @@ mod tests {
             .find(|a| a.atom_id() == "C")
             .expect("ALA has a backbone C");
 
-        assert!(!type_atom(c, ala).contains(AtomTypeBits::HYDROPHOBE));
+        assert!(!type_atom(c, ala, PHYSIOLOGICAL_PH).contains(AtomTypeBits::HYDROPHOBE));
     }
 
     #[test]
@@ -443,7 +468,7 @@ mod tests {
             .find(|a| a.atom_id() == "CZ")
             .expect("PHE has a CZ");
 
-        let bits = type_atom(cz, phe);
+        let bits = type_atom(cz, phe, PHYSIOLOGICAL_PH);
         assert!(bits.contains(AtomTypeBits::AROMATIC));
         assert!(bits.contains(AtomTypeBits::HYDROPHOBE));
     }
@@ -460,7 +485,7 @@ mod tests {
             .find(|a| a.atom_id() == "N")
             .expect("ALA has a backbone N");
 
-        let bits = type_atom(n, ala);
+        let bits = type_atom(n, ala, PHYSIOLOGICAL_PH);
         assert!(bits.contains(AtomTypeBits::HBOND_DONOR));
         assert!(bits.contains(AtomTypeBits::HBOND_ACCEPTOR));
     }
@@ -477,7 +502,7 @@ mod tests {
             .find(|a| a.atom_id() == "O")
             .expect("ALA has a backbone carbonyl O");
 
-        let bits = type_atom(o, ala);
+        let bits = type_atom(o, ala, PHYSIOLOGICAL_PH);
         assert!(bits.contains(AtomTypeBits::HBOND_ACCEPTOR));
         assert!(!bits.contains(AtomTypeBits::HBOND_DONOR));
     }
@@ -498,7 +523,7 @@ mod tests {
             .find(|a| a.atom_id() == "OXT")
             .expect("ALA has an OXT in its free-acid CCD form");
 
-        let bits = type_atom(oxt, ala);
+        let bits = type_atom(oxt, ala, PHYSIOLOGICAL_PH);
         assert!(
             !bits.contains(AtomTypeBits::HBOND_DONOR),
             "a carboxyl oxygen is deprotonated at physiological pH, not a real donor"
@@ -519,7 +544,7 @@ mod tests {
             .find(|a| a.atom_id() == "NZ")
             .expect("LYS has an NZ");
 
-        let bits = type_atom(nz, lys);
+        let bits = type_atom(nz, lys, PHYSIOLOGICAL_PH);
         assert!(bits.contains(AtomTypeBits::HBOND_DONOR));
         assert!(
             !bits.contains(AtomTypeBits::HBOND_ACCEPTOR),
@@ -538,7 +563,7 @@ mod tests {
                 .iter()
                 .find(|a| a.atom_id() == id)
                 .unwrap_or_else(|| panic!("ARG should have a {id}"));
-            let bits = type_atom(atom, arg);
+            let bits = type_atom(atom, arg, PHYSIOLOGICAL_PH);
             assert!(
                 bits.contains(AtomTypeBits::POS_IONISABLE),
                 "{id} should be part of the guanidinium group"
@@ -550,10 +575,10 @@ mod tests {
         }
         // CZ itself has no attached hydrogen -- NE/NH1/NH2 do.
         let cz = arg.atoms().iter().find(|a| a.atom_id() == "CZ").unwrap();
-        assert!(!type_atom(cz, arg).contains(AtomTypeBits::HBOND_DONOR));
+        assert!(!type_atom(cz, arg, PHYSIOLOGICAL_PH).contains(AtomTypeBits::HBOND_DONOR));
         for id in ["NE", "NH1", "NH2"] {
             let atom = arg.atoms().iter().find(|a| a.atom_id() == id).unwrap();
-            assert!(type_atom(atom, arg).contains(AtomTypeBits::HBOND_DONOR));
+            assert!(type_atom(atom, arg, PHYSIOLOGICAL_PH).contains(AtomTypeBits::HBOND_DONOR));
         }
     }
 
@@ -563,7 +588,7 @@ mod tests {
         let lys = components.get("LYS").expect("LYS should be bundled");
         let nz = lys.atoms().iter().find(|a| a.atom_id() == "NZ").unwrap();
 
-        assert!(type_atom(nz, lys).contains(AtomTypeBits::POS_IONISABLE));
+        assert!(type_atom(nz, lys, PHYSIOLOGICAL_PH).contains(AtomTypeBits::POS_IONISABLE));
     }
 
     #[test]
@@ -574,8 +599,8 @@ mod tests {
         let od1 = asp.atoms().iter().find(|a| a.atom_id() == "OD1").unwrap();
         let od2 = asp.atoms().iter().find(|a| a.atom_id() == "OD2").unwrap();
 
-        let od1_bits = type_atom(od1, asp);
-        let od2_bits = type_atom(od2, asp);
+        let od1_bits = type_atom(od1, asp, PHYSIOLOGICAL_PH);
+        let od2_bits = type_atom(od2, asp, PHYSIOLOGICAL_PH);
 
         assert!(od1_bits.contains(AtomTypeBits::NEG_IONISABLE));
         assert!(od2_bits.contains(AtomTypeBits::NEG_IONISABLE));
@@ -597,6 +622,31 @@ mod tests {
     }
 
     #[test]
+    fn aspartates_carboxylate_becomes_a_real_donor_at_a_low_enough_ph() {
+        // Same real OD2 as the physiological-pH test above, but below the
+        // representative carboxyl pKa (~4.0): now genuinely protonated, so
+        // OD2 (which carries the free-acid hydrogen in this CCD form)
+        // should become a real donor -- this is the actual regression test
+        // for `ph` being a real, consulted parameter rather than a
+        // hardcoded assumption.
+        let components = common_components();
+        let asp = components.get("ASP").expect("ASP should be bundled");
+        let od2 = asp.atoms().iter().find(|a| a.atom_id() == "OD2").unwrap();
+
+        let acidic_bits = type_atom(od2, asp, 2.0);
+        assert!(
+            acidic_bits.contains(AtomTypeBits::HBOND_DONOR),
+            "at pH 2.0 (below the carboxyl's ~4.0 pKa), OD2 should be a real, protonated donor"
+        );
+
+        let physiological_bits = type_atom(od2, asp, PHYSIOLOGICAL_PH);
+        assert!(
+            !physiological_bits.contains(AtomTypeBits::HBOND_DONOR),
+            "the same atom at physiological pH should not be a donor"
+        );
+    }
+
+    #[test]
     fn alanines_free_acid_backbone_is_also_neg_ionisable_unlike_arpeggios_own_table() {
         // Deliberate, known divergence from real arpeggio: its hardcoded
         // PROT_ATOM_TYPES only lists ASP/GLU side chains as neg-ionisable,
@@ -610,8 +660,8 @@ mod tests {
         let o = ala.atoms().iter().find(|a| a.atom_id() == "O").unwrap();
         let oxt = ala.atoms().iter().find(|a| a.atom_id() == "OXT").unwrap();
 
-        assert!(type_atom(o, ala).contains(AtomTypeBits::NEG_IONISABLE));
-        assert!(type_atom(oxt, ala).contains(AtomTypeBits::NEG_IONISABLE));
+        assert!(type_atom(o, ala, PHYSIOLOGICAL_PH).contains(AtomTypeBits::NEG_IONISABLE));
+        assert!(type_atom(oxt, ala, PHYSIOLOGICAL_PH).contains(AtomTypeBits::NEG_IONISABLE));
     }
 
     #[test]
@@ -620,7 +670,7 @@ mod tests {
         let ala = components.get("ALA").expect("ALA should be bundled");
         let cb = ala.atoms().iter().find(|a| a.atom_id() == "CB").unwrap();
 
-        assert!(type_atom(cb, ala).contains(AtomTypeBits::WEAK_HBOND_DONOR));
+        assert!(type_atom(cb, ala, PHYSIOLOGICAL_PH).contains(AtomTypeBits::WEAK_HBOND_DONOR));
     }
 
     #[test]
@@ -629,7 +679,7 @@ mod tests {
         let ala = components.get("ALA").expect("ALA should be bundled");
         let c = ala.atoms().iter().find(|a| a.atom_id() == "C").unwrap();
 
-        assert!(!type_atom(c, ala).contains(AtomTypeBits::WEAK_HBOND_DONOR));
+        assert!(!type_atom(c, ala, PHYSIOLOGICAL_PH).contains(AtomTypeBits::WEAK_HBOND_DONOR));
     }
 
     #[test]
@@ -640,7 +690,7 @@ mod tests {
         // the backbone, no room left for a hydrogen.
         let cg = phe.atoms().iter().find(|a| a.atom_id() == "CG").unwrap();
 
-        assert!(!type_atom(cg, phe).contains(AtomTypeBits::WEAK_HBOND_DONOR));
+        assert!(!type_atom(cg, phe, PHYSIOLOGICAL_PH).contains(AtomTypeBits::WEAK_HBOND_DONOR));
     }
 
     #[test]
@@ -649,7 +699,7 @@ mod tests {
         let ala = components.get("ALA").expect("ALA should be bundled");
         let o = ala.atoms().iter().find(|a| a.atom_id() == "O").unwrap();
 
-        let bits = type_atom(o, ala);
+        let bits = type_atom(o, ala, PHYSIOLOGICAL_PH);
         assert!(bits.contains(AtomTypeBits::HBOND_ACCEPTOR));
         assert!(bits.contains(AtomTypeBits::WEAK_HBOND_ACCEPTOR));
     }
@@ -663,7 +713,7 @@ mod tests {
         // weak acceptor is derived from the same lone-pair criterion as
         // the strong acceptor rule, so the same guanidinium exclusion
         // carries through here too.
-        assert!(!type_atom(nh1, arg).contains(AtomTypeBits::WEAK_HBOND_ACCEPTOR));
+        assert!(!type_atom(nh1, arg, PHYSIOLOGICAL_PH).contains(AtomTypeBits::WEAK_HBOND_ACCEPTOR));
     }
 
     #[test]
@@ -681,7 +731,7 @@ mod tests {
             .find(|a| a.atom_id() == "CL6")
             .expect("8CL has a CL6 chlorine bonded to the ring");
 
-        let bits = type_atom(cl, &component);
+        let bits = type_atom(cl, &component, PHYSIOLOGICAL_PH);
         assert!(bits.contains(AtomTypeBits::WEAK_HBOND_ACCEPTOR));
         assert!(
             !bits.contains(AtomTypeBits::HBOND_ACCEPTOR),
@@ -699,7 +749,7 @@ mod tests {
             .find(|a| a.atom_id() == "CL6")
             .expect("8CL has a CL6 chlorine bonded to the ring");
 
-        assert!(type_atom(cl, &component).contains(AtomTypeBits::XBOND_DONOR));
+        assert!(type_atom(cl, &component, PHYSIOLOGICAL_PH).contains(AtomTypeBits::XBOND_DONOR));
     }
 
     #[test]
@@ -711,7 +761,7 @@ mod tests {
         let cl_ion = components.get("CL").expect("CL should be bundled");
         let cl_atom = cl_ion.atoms().iter().find(|a| a.atom_id() == "CL").unwrap();
 
-        assert!(!type_atom(cl_atom, cl_ion).contains(AtomTypeBits::XBOND_DONOR));
+        assert!(!type_atom(cl_atom, cl_ion, PHYSIOLOGICAL_PH).contains(AtomTypeBits::XBOND_DONOR));
     }
 
     #[test]
@@ -722,7 +772,8 @@ mod tests {
         let cl_ion = components.get("CL").expect("CL should be bundled");
         let cl_atom = cl_ion.atoms().iter().find(|a| a.atom_id() == "CL").unwrap();
 
-        assert!(!type_atom(cl_atom, cl_ion).contains(AtomTypeBits::WEAK_HBOND_ACCEPTOR));
+        assert!(!type_atom(cl_atom, cl_ion, PHYSIOLOGICAL_PH)
+            .contains(AtomTypeBits::WEAK_HBOND_ACCEPTOR));
     }
 
     #[test]
@@ -736,7 +787,7 @@ mod tests {
             .find(|a| a.atom_id() == "CB")
             .expect("ALA has a CB");
 
-        let bits = type_atom(cb, ala);
+        let bits = type_atom(cb, ala, PHYSIOLOGICAL_PH);
         assert!(!bits.contains(AtomTypeBits::HBOND_DONOR));
         assert!(!bits.contains(AtomTypeBits::HBOND_ACCEPTOR));
     }
@@ -752,7 +803,7 @@ mod tests {
             .find(|a| a.atom_id() == "CB")
             .expect("ALA has a CB atom");
 
-        let bits = type_atom(cb, ala);
+        let bits = type_atom(cb, ala, PHYSIOLOGICAL_PH);
 
         // CB is genuinely HYDROPHOBE (see alanines_methyl_carbon_is_hydrophobe)
         // -- this test only cares that the unrelated categories stay clear.

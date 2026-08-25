@@ -184,6 +184,7 @@ impl AtomSiftMatch<'_> {
 pub fn compute_atom_sift_matches<'a>(
     pdb: &'a PDB,
     components: &'a HashMap<String, CcdComponent>,
+    ph: f64,
 ) -> Result<Vec<AtomSiftMatch<'a>>, String> {
     let atoms: Vec<_> = pdb.atoms_with_hierarchy().collect();
     let seeds: Vec<(AtomKey, AtomSiftMatch<'a>)> = atoms
@@ -194,7 +195,7 @@ pub fn compute_atom_sift_matches<'a>(
                 let comp_id = hierarchy.residue().name().unwrap_or_default();
                 return Err(format!("unknown CCD component: {comp_id}"));
             };
-            let bits = type_atom(ccd_atom, component);
+            let bits = type_atom(ccd_atom, component, ph);
             let potential = potential_features(bits, ccd_atom.element());
             Ok((
                 atom_key(hierarchy.atom()),
@@ -212,7 +213,7 @@ pub fn compute_atom_sift_matches<'a>(
     let classified: Vec<(AtomKey, AtomKey, FeatureBits)> = contacts
         .par_iter()
         .map(|contact| {
-            let features = classify_features(contact, components);
+            let features = classify_features(contact, components, ph);
             (
                 atom_key(contact.atom_1.atom()),
                 atom_key(contact.atom_2.atom()),
@@ -241,6 +242,7 @@ pub fn compute_atom_sift_matches<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::typing::PHYSIOLOGICAL_PH;
     use pdbtbx::ContainsAtomConformerResidue;
     use rspeggio_ccd::common::common_components;
 
@@ -276,7 +278,7 @@ mod tests {
                 .expect("ZN fixture should parse");
         components.insert("ZN".to_string(), zn);
 
-        let matches = compute_atom_sift_matches(&pdb, &components)
+        let matches = compute_atom_sift_matches(&pdb, &components, PHYSIOLOGICAL_PH)
             .expect("1CA2 is amino acids + water + zinc, all now known");
 
         let his_ne2 = find_match(&matches, "HIS", 94, "NE2");
@@ -293,8 +295,8 @@ mod tests {
             pdbtbx::open("../../tests/fixtures/structures/1UBQ.cif").expect("1UBQ should load");
         let components = common_components();
 
-        let matches =
-            compute_atom_sift_matches(&pdb, &components).expect("1UBQ should all be known");
+        let matches = compute_atom_sift_matches(&pdb, &components, PHYSIOLOGICAL_PH)
+            .expect("1UBQ should all be known");
 
         // ALA's CB is a plain methyl carbon -- real chemistry, no ionisable
         // capacity whatsoever (confirmed already by `typing.rs`'s own
@@ -321,8 +323,8 @@ mod tests {
             pdbtbx::open("../../tests/fixtures/structures/1UBQ.cif").expect("1UBQ should load");
         let components = common_components();
 
-        let matches =
-            compute_atom_sift_matches(&pdb, &components).expect("1UBQ should all be known");
+        let matches = compute_atom_sift_matches(&pdb, &components, PHYSIOLOGICAL_PH)
+            .expect("1UBQ should all be known");
 
         let found = matches
             .iter()
@@ -343,7 +345,8 @@ mod tests {
                 .expect("ZN fixture should parse");
         components.insert("ZN".to_string(), zn);
 
-        let matches = compute_atom_sift_matches(&pdb, &components).expect("1CA2 should export");
+        let matches = compute_atom_sift_matches(&pdb, &components, PHYSIOLOGICAL_PH)
+            .expect("1CA2 should export");
         let his_ne2 = find_match(&matches, "HIS", 94, "NE2");
 
         let human = his_ne2.human_readable();
@@ -362,6 +365,6 @@ mod tests {
             pdbtbx::open("../../tests/fixtures/structures/1UBQ.cif").expect("1UBQ should load");
         let components: HashMap<String, CcdComponent> = HashMap::new();
 
-        assert!(compute_atom_sift_matches(&pdb, &components).is_err());
+        assert!(compute_atom_sift_matches(&pdb, &components, PHYSIOLOGICAL_PH).is_err());
     }
 }

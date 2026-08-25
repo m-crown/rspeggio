@@ -62,6 +62,10 @@ fn load_components(extra_ccd_paths: &[String]) -> PyResult<HashMap<String, CcdCo
 ///         ``["RESNAME:ZN"]`` or ``["/A/45/"]``. Omit (or pass ``None``)
 ///         for whole-structure mode, where every residue is treated as
 ///         selected.
+///     ph: solution pH used for the one pH-dependent typing rule this
+///         project has (free/side-chain carboxyl-group protonation --
+///         see ``rspeggio_core::typing::type_atom``'s own doc). Defaults
+///         to physiological pH (7.4), real pdbe-arpeggio's own default.
 ///
 /// Returns:
 ///     A JSON string: a list of contact objects. Parse it with
@@ -73,11 +77,12 @@ fn load_components(extra_ccd_paths: &[String]) -> PyResult<HashMap<String, CcdCo
 ///         selection matched no real atoms, or a selection string is
 ///         malformed.
 #[pyfunction]
-#[pyo3(signature = (structure_path, extra_ccd_paths=Vec::new(), selection=None))]
+#[pyo3(signature = (structure_path, extra_ccd_paths=Vec::new(), selection=None, ph=rspeggio_core::typing::PHYSIOLOGICAL_PH))]
 fn get_contacts(
     structure_path: String,
     extra_ccd_paths: Vec<String>,
     selection: Option<Vec<String>>,
+    ph: f64,
 ) -> PyResult<String> {
     let (pdb, _errors) = pdbtbx::open(&structure_path).map_err(|errors| {
         PyValueError::new_err(format!("failed to open {structure_path:?}: {errors:?}"))
@@ -90,7 +95,7 @@ fn get_contacts(
         None => SelectionContext::whole_structure(&pdb),
     };
 
-    let contacts = export_all_contacts(&pdb, &components, &selection_context)
+    let contacts = export_all_contacts(&pdb, &components, &selection_context, ph)
         .map_err(PyValueError::new_err)?;
 
     serde_json::to_string(&contacts)

@@ -841,7 +841,7 @@ mod tests {
             .iter()
             .find(|a| a.atom_id() == "CB")
             .expect("ARG's CCD entry should have a CB");
-        let bits = crate::typing::type_atom(cb_ccd, arg_component);
+        let bits = crate::typing::type_atom(cb_ccd, arg_component, crate::typing::PHYSIOLOGICAL_PH);
 
         let interactions = classify_ring_atom(&geometry, cb.pos(), "C", "ARG", bits);
         assert_eq!(
@@ -875,7 +875,7 @@ mod tests {
             .iter()
             .find(|a| a.atom_id() == "NZ")
             .expect("LYS's CCD entry should have an NZ");
-        let bits = crate::typing::type_atom(nz_ccd, lys_component);
+        let bits = crate::typing::type_atom(nz_ccd, lys_component, crate::typing::PHYSIOLOGICAL_PH);
 
         let interactions = classify_ring_atom(&geometry, nz.pos(), "N", "LYS", bits);
         assert!(interactions.contains(&RingAtomInteraction::CationPi));
@@ -907,7 +907,7 @@ mod tests {
             .iter()
             .find(|a| a.atom_id() == "SD")
             .expect("MET's CCD entry should have an SD");
-        let bits = crate::typing::type_atom(sd_ccd, met_component);
+        let bits = crate::typing::type_atom(sd_ccd, met_component, crate::typing::PHYSIOLOGICAL_PH);
 
         let interactions = classify_ring_atom(&geometry, sd.pos(), "S", "MET", bits);
         assert_eq!(interactions, vec![RingAtomInteraction::MetSulphurPi]);
@@ -952,7 +952,7 @@ mod tests {
             .iter()
             .find(|a| a.atom_id() == "CL6")
             .expect("8CL has a CL6 chlorine bonded to the ring");
-        let bits = crate::typing::type_atom(cl, &component);
+        let bits = crate::typing::type_atom(cl, &component, crate::typing::PHYSIOLOGICAL_PH);
         assert!(
             bits.contains(AtomTypeBits::XBOND_DONOR),
             "sanity check: CL6 should really be typed as an xbond donor"
