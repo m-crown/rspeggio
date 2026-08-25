@@ -1,10 +1,27 @@
 // crates/rspeggio-core/src/export.rs
 //
 // M7: JSON export matching real pdbe-arpeggio's own schema
-// (`Arpeggio.get_contacts` in `interactions.py`), for the atom-atom
-// contact type only -- the plane-plane/atom-plane/group-plane types
-// `rings.rs` already computes the geometry for aren't wired into export
-// yet, a follow-up slice, not a silent gap.
+// (`Arpeggio.get_contacts` in `interactions.py`) -- atom-atom, plus the
+// four ring/amide "plane" contact types `rings.rs` already computes the
+// geometry for: plane-plane (ring-ring), atom-plane (ring-atom),
+// group-group (amide-amide), group-plane (amide-ring).
+//
+// Real, confirmed limitation worth knowing before reading further: ring
+// perception (`rings::perceive_rings`) only sees rings whose bonds are
+// flagged `pdbx_aromatic_flag = Y` in their real CCD entry (decisions
+// 01/04 -- no geometric re-perception). HEM's real CCD entry flags this
+// *inconsistently* across its own four chemically-equivalent pyrrole
+// rings (checked directly): rings A and C (`NA-C1A-C2A-C3A-C4A`,
+// `NC-C1C-C2C-C3C-C4C`) are flagged aromatic and so are perceived here;
+// rings B and D are not, and aren't. Real pdbe-arpeggio doesn't have this
+// gap at all -- its OpenBabel-based aromaticity *re*-perception treats all
+// four consistently (confirmed: `tests/fixtures/golden/1MBO.json` has a
+// real CARBONPI atom-plane entry against ring B specifically, which this
+// project's CCD-flag-based perception can't see). A real, principled
+// consequence of the project's own no-re-perception decision, not a bug
+// in the ring-perception algorithm itself -- but real CCD curation isn't
+// perfectly self-consistent either, worth knowing precisely rather than
+// assuming "HEM has no rings at all".
 //
 // Scope decision (asked, not guessed): this only implements
 // "whole-structure" mode -- every residue treated as if it were real
@@ -29,11 +46,15 @@
 // and this module's tests do exactly that.
 
 use crate::config::{self, DistanceCategory, FeatureBits};
-use crate::contacts::{find_contacts, Contact};
+use crate::contacts::{euclidean_distance, find_contacts, Contact};
 use crate::features::classify_features;
+use crate::rings::{
+    self, AmideGeometry, AmideGroup, RingAtomInteraction, RingAtoms, RingGeometry,
+    RingRingInteraction,
+};
 use pdbtbx::{
     AtomConformerResidueChainModel, ContainsAtomConformer, ContainsAtomConformerResidue,
-    ContainsAtomConformerResidueChain, PDB,
+    ContainsAtomConformerResidueChain, Residue, PDB,
 };
 use rspeggio_ccd::component::{CcdComponent, ComponentType};
 use serde::Serialize;
@@ -52,6 +73,36 @@ pub struct AtomIdentity {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AtomAtomContactJson {
+    pub bgn: AtomIdentity,
+    pub end: AtomIdentity,
+    #[serde(rename = "type")]
+    pub entry_type: &'static str,
+    pub distance: f64,
+    pub contact: Vec<&'static str>,
+    pub interacting_entities: &'static str,
+}
+
+// The shape real `_prepare_plane_plane_contact_for_export` builds --
+// shared by plane-plane (ring-ring), group-group (amide-amide), and
+// group-plane (amide-ring), same as the oracle reuses one function for
+// all three. `bgn`/`end` are `AtomIdentity`s built by `group_identity`
+// (a ring/amide's own residue position, with `auth_atom_id` set to its
+// member atoms rather than a single real atom).
+#[derive(Debug, Clone, Serialize)]
+pub struct PlanePlaneContactJson {
+    pub bgn: AtomIdentity,
+    pub end: AtomIdentity,
+    #[serde(rename = "type")]
+    pub entry_type: &'static str,
+    pub distance: f64,
+    pub contact: Vec<&'static str>,
+    pub interacting_entities: &'static str,
+}
+
+// Real `_prepare_atom_plane_contact_for_export`'s shape (atom-plane,
+// ring-atom): `bgn` is a real atom, `end` is the ring it's near.
+#[derive(Debug, Clone, Serialize)]
+pub struct AtomPlaneContactJson {
     pub bgn: AtomIdentity,
     pub end: AtomIdentity,
     #[serde(rename = "type")]
@@ -188,6 +239,354 @@ pub fn export_atom_atom_contacts(
         .iter()
         .map(|c| build_atom_atom_entry(c, components))
         .collect()
+}
+
+// A "group" identity (a ring or amide's real position in the structure,
+// e.g. `end.auth_atom_id` in real pdbe-arpeggio's own atom-plane JSON,
+// `"C1B,C2B,C3B,C4B,NB"`) is the same shape as a single atom's
+// (`AtomIdentity`) with `auth_atom_id` set to the sorted, comma-joined
+// member atom names instead of one real atom's name -- real
+// `_prepare_plane_plane_contact_for_export` builds it exactly this way
+// (`make_pymol_json` on the *residue*, then separately overwrites
+// `auth_atom_id`), so this reuses `AtomIdentity` rather than a separate type.
+fn group_identity(
+    hierarchy: &AtomConformerResidueChainModel,
+    component: &CcdComponent,
+    member_atom_ids: &[String],
+) -> AtomIdentity {
+    let residue = hierarchy.residue();
+    let mut sorted_ids = member_atom_ids.to_vec();
+    sorted_ids.sort();
+    AtomIdentity {
+        auth_asym_id: hierarchy.chain().id().to_string(),
+        auth_atom_id: sorted_ids.join(","),
+        auth_seq_id: residue.id().0,
+        label_comp_id: residue.name().unwrap_or_default().to_string(),
+        label_comp_type: component.component_type().code(),
+        pdbx_pdb_ins_code: insertion_code(residue),
+    }
+}
+
+fn ring_ring_label(kind: RingRingInteraction) -> &'static str {
+    match kind {
+        RingRingInteraction::Ff => "FF",
+        RingRingInteraction::Of => "OF",
+        RingRingInteraction::Ee => "EE",
+        RingRingInteraction::Ft => "FT",
+        RingRingInteraction::Ot => "OT",
+        RingRingInteraction::Et => "ET",
+        RingRingInteraction::Fe => "FE",
+        RingRingInteraction::Oe => "OE",
+        RingRingInteraction::Ef => "EF",
+    }
+}
+
+fn ring_atom_label(kind: RingAtomInteraction) -> &'static str {
+    match kind {
+        RingAtomInteraction::CarbonPi => "CARBONPI",
+        RingAtomInteraction::CationPi => "CATIONPI",
+        RingAtomInteraction::DonorPi => "DONORPI",
+        RingAtomInteraction::HalogenPi => "HALOGENPI",
+        RingAtomInteraction::MetSulphurPi => "METSULPHURPI",
+    }
+}
+
+fn amide_member_ids(amide: &AmideGroup) -> [String; 4] {
+    [
+        amide.nitrogen_id.clone(),
+        amide.carbon_id.clone(),
+        amide.oxygen_id.clone(),
+        amide.other_carbon_id.clone(),
+    ]
+}
+
+// Every real, distinct residue instance in `pdb`, each carrying its chain
+// (needed for `auth_asym_id`, which a bare `&Residue` doesn't have) --
+// deduped by residue identity (pointer equality into the same live `PDB`),
+// same technique `contacts::find_contacts` already uses for intra-residue
+// filtering.
+fn residue_instances(pdb: &PDB) -> Vec<AtomConformerResidueChainModel<'_>> {
+    let mut seen: Vec<*const Residue> = Vec::new();
+    let mut result = Vec::new();
+    for hierarchy in pdb.atoms_with_hierarchy() {
+        let ptr = hierarchy.residue() as *const Residue;
+        if seen.contains(&ptr) {
+            continue;
+        }
+        seen.push(ptr);
+        result.push(hierarchy);
+    }
+    result
+}
+
+// One perceived ring, in one real residue instance, with its real
+// geometry already resolved.
+struct RingInstance<'a> {
+    hierarchy: AtomConformerResidueChainModel<'a>,
+    component: &'a CcdComponent,
+    ring: RingAtoms,
+    geometry: RingGeometry,
+}
+
+// Every real ring instance across the whole structure. A residue whose
+// comp_id has no matching `CcdComponent` simply contributes no rings --
+// unlike `export_atom_atom_contacts`, this doesn't fail loudly for that,
+// since an unknown residue can't be typed/perceived at all regardless (see
+// `export_atom_plane_contacts`'s own doc for why atom-plane's per-atom
+// lookups follow the same "skip, don't fail" posture).
+fn collect_ring_instances<'a>(
+    pdb: &'a PDB,
+    components: &'a HashMap<String, CcdComponent>,
+) -> Vec<RingInstance<'a>> {
+    let mut instances = Vec::new();
+    for hierarchy in residue_instances(pdb) {
+        let comp_id = hierarchy.residue().name().unwrap_or_default();
+        let Some(component) = components.get(comp_id) else {
+            continue;
+        };
+        for ring in rings::perceive_rings(component) {
+            if let Some(geometry) = rings::ring_geometry(&ring, hierarchy.residue()) {
+                instances.push(RingInstance {
+                    hierarchy: hierarchy.clone(),
+                    component,
+                    ring,
+                    geometry,
+                });
+            }
+        }
+    }
+    instances
+}
+
+struct AmideInstance<'a> {
+    hierarchy: AtomConformerResidueChainModel<'a>,
+    component: &'a CcdComponent,
+    amide: AmideGroup,
+    geometry: AmideGeometry,
+}
+
+fn collect_amide_instances<'a>(
+    pdb: &'a PDB,
+    components: &'a HashMap<String, CcdComponent>,
+) -> Vec<AmideInstance<'a>> {
+    let mut instances = Vec::new();
+    for hierarchy in residue_instances(pdb) {
+        let comp_id = hierarchy.residue().name().unwrap_or_default();
+        let Some(component) = components.get(comp_id) else {
+            continue;
+        };
+        for amide in rings::perceive_amide_groups(component) {
+            if let Some(geometry) = rings::amide_geometry(&amide, hierarchy.residue()) {
+                instances.push(AmideInstance {
+                    hierarchy: hierarchy.clone(),
+                    component,
+                    amide,
+                    geometry,
+                });
+            }
+        }
+    }
+    instances
+}
+
+// Real pdbe-arpeggio's plane-plane (ring-ring, `interactions.py`'s
+// `__calculate_plane_plane_contacts`), whole-structure mode: every pair of
+// distinct real ring instances within `rings::CENTROID_DISTANCE_MAX`,
+// excluding an intra-residue `EE` pair specifically (real arpeggio's own
+// "don't count intra-residue edge-to-edge to avoid intra-heterocycle
+// interactions" rule -- everything else, including other intra-residue
+// pairs, is kept, matching the oracle).
+pub fn export_plane_plane_contacts(
+    pdb: &PDB,
+    components: &HashMap<String, CcdComponent>,
+) -> Vec<PlanePlaneContactJson> {
+    let ring_instances = collect_ring_instances(pdb, components);
+    let mut entries = Vec::new();
+
+    for i in 0..ring_instances.len() {
+        for j in (i + 1)..ring_instances.len() {
+            let a = &ring_instances[i];
+            let b = &ring_instances[j];
+            let Some((distance, kind)) = rings::classify_ring_ring(&a.geometry, &b.geometry) else {
+                continue;
+            };
+            let intra_residue = std::ptr::eq(a.hierarchy.residue(), b.hierarchy.residue());
+            if intra_residue && kind == RingRingInteraction::Ee {
+                continue;
+            }
+
+            entries.push(PlanePlaneContactJson {
+                bgn: group_identity(&a.hierarchy, a.component, &a.ring.atom_ids),
+                end: group_identity(&b.hierarchy, b.component, &b.ring.atom_ids),
+                entry_type: "plane-plane",
+                distance: round_2(distance),
+                contact: vec![ring_ring_label(kind)],
+                interacting_entities: "INTRA_SELECTION",
+            });
+        }
+    }
+    entries
+}
+
+// Real pdbe-arpeggio's atom-plane (ring-atom, `__calculate_atom_plane_contacts`),
+// whole-structure mode: every real (non-hydrogen) atom against every real
+// ring instance. Unlike `export_atom_atom_contacts`, an atom whose own
+// residue isn't known is silently skipped rather than failing the whole
+// export: real arpeggio's own SIFt-typing step can't classify it either
+// way (there's no chemistry to check the ring-face angle/typing rules
+// against), so skipping it loses nothing an error would have preserved --
+// it simply never could have produced an interaction.
+pub fn export_atom_plane_contacts(
+    pdb: &PDB,
+    components: &HashMap<String, CcdComponent>,
+) -> Vec<AtomPlaneContactJson> {
+    let ring_instances = collect_ring_instances(pdb, components);
+    let mut entries = Vec::new();
+
+    for ring in &ring_instances {
+        for hierarchy in pdb.atoms_with_hierarchy() {
+            if hierarchy.atom().element().map(|e| e.symbol()) == Some("H") {
+                continue;
+            }
+            let joined = crate::join::join_atom(hierarchy.clone(), components);
+            let (Some(ccd_atom), Some(atom_component)) = (joined.ccd_atom, joined.component) else {
+                continue;
+            };
+            let bits = crate::typing::type_atom(ccd_atom, atom_component);
+
+            let interactions = rings::classify_ring_atom(
+                &ring.geometry,
+                hierarchy.atom().pos(),
+                ccd_atom.element(),
+                hierarchy.residue().name().unwrap_or_default(),
+                bits,
+            );
+            if interactions.is_empty() {
+                continue;
+            }
+            let mut labels: Vec<&'static str> =
+                interactions.iter().map(|i| ring_atom_label(*i)).collect();
+            labels.sort_unstable();
+
+            let distance = euclidean_distance(hierarchy.atom().pos(), ring.geometry.center);
+
+            entries.push(AtomPlaneContactJson {
+                bgn: atom_identity(&hierarchy, atom_component),
+                end: group_identity(&ring.hierarchy, ring.component, &ring.ring.atom_ids),
+                entry_type: "atom-plane",
+                distance: round_2(distance),
+                contact: labels,
+                interacting_entities: "INTRA_SELECTION",
+            });
+        }
+    }
+    entries
+}
+
+// Real pdbe-arpeggio's group-group (amide-amide, `__calculate_group_group_contacts`),
+// whole-structure mode: every pair of distinct real amide instances that
+// pass the shared face-on geometric test.
+pub fn export_group_group_contacts(
+    pdb: &PDB,
+    components: &HashMap<String, CcdComponent>,
+) -> Vec<PlanePlaneContactJson> {
+    let amide_instances = collect_amide_instances(pdb, components);
+    let mut entries = Vec::new();
+
+    for i in 0..amide_instances.len() {
+        for j in (i + 1)..amide_instances.len() {
+            let a = &amide_instances[i];
+            let b = &amide_instances[j];
+            let Some(distance) = rings::classify_amide_amide(&a.geometry, &b.geometry) else {
+                continue;
+            };
+            entries.push(PlanePlaneContactJson {
+                bgn: group_identity(&a.hierarchy, a.component, &amide_member_ids(&a.amide)),
+                end: group_identity(&b.hierarchy, b.component, &amide_member_ids(&b.amide)),
+                entry_type: "group-group",
+                distance: round_2(distance),
+                contact: vec!["AMIDEAMIDE"],
+                interacting_entities: "INTRA_SELECTION",
+            });
+        }
+    }
+    entries
+}
+
+// Real pdbe-arpeggio's group-plane (amide-ring, `__calculate_group_plane_contacts`),
+// whole-structure mode: every real amide instance against every real ring
+// instance that passes the shared face-on geometric test.
+pub fn export_group_plane_contacts(
+    pdb: &PDB,
+    components: &HashMap<String, CcdComponent>,
+) -> Vec<PlanePlaneContactJson> {
+    let amide_instances = collect_amide_instances(pdb, components);
+    let ring_instances = collect_ring_instances(pdb, components);
+    let mut entries = Vec::new();
+
+    for amide in &amide_instances {
+        for ring in &ring_instances {
+            let Some(distance) = rings::classify_amide_ring(&amide.geometry, &ring.geometry) else {
+                continue;
+            };
+            entries.push(PlanePlaneContactJson {
+                bgn: group_identity(
+                    &amide.hierarchy,
+                    amide.component,
+                    &amide_member_ids(&amide.amide),
+                ),
+                end: group_identity(&ring.hierarchy, ring.component, &ring.ring.atom_ids),
+                entry_type: "group-plane",
+                distance: round_2(distance),
+                contact: vec!["AMIDERING"],
+                interacting_entities: "INTRA_SELECTION",
+            });
+        }
+    }
+    entries
+}
+
+// Every contact of every type this module can export, combined into one
+// list the way real `Arpeggio.get_contacts` returns them all together.
+// `Err` only from the atom-atom half (see `export_atom_atom_contacts`);
+// the plane/group halves never fail loudly (see their own docs).
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum ContactJson {
+    AtomAtom(AtomAtomContactJson),
+    Group(PlanePlaneContactJson),
+    AtomPlane(AtomPlaneContactJson),
+}
+
+pub fn export_all_contacts(
+    pdb: &PDB,
+    components: &HashMap<String, CcdComponent>,
+) -> Result<Vec<ContactJson>, String> {
+    let mut entries: Vec<ContactJson> = export_atom_atom_contacts(pdb, components)?
+        .into_iter()
+        .map(ContactJson::AtomAtom)
+        .collect();
+    entries.extend(
+        export_plane_plane_contacts(pdb, components)
+            .into_iter()
+            .map(ContactJson::Group),
+    );
+    entries.extend(
+        export_atom_plane_contacts(pdb, components)
+            .into_iter()
+            .map(ContactJson::AtomPlane),
+    );
+    entries.extend(
+        export_group_group_contacts(pdb, components)
+            .into_iter()
+            .map(ContactJson::Group),
+    );
+    entries.extend(
+        export_group_plane_contacts(pdb, components)
+            .into_iter()
+            .map(ContactJson::Group),
+    );
+    Ok(entries)
 }
 
 #[cfg(test)]
@@ -395,5 +794,157 @@ mod tests {
         }
         assert!(json["bgn"].get("pdbx_PDB_ins_code").is_some());
         assert_eq!(json["type"], "atom-atom");
+    }
+
+    #[test]
+    fn a_real_ring_ring_contact_matches_rings_rs_own_worked_example() {
+        // TRP5's 5-membered pyrrole ring <-> TRP16's own, EF, 5.58A -- the
+        // exact real pair `rings.rs`'s ring-perception/geometry work
+        // already surfaced from 1CA2 (see this crate's own commit
+        // history), re-verified here through the export path instead of
+        // calling `rings::classify_ring_ring` directly.
+        let (pdb, _errors) =
+            pdbtbx::open("../../tests/fixtures/structures/1CA2.cif").expect("1CA2 should load");
+        let components = common_components();
+
+        let entries = export_plane_plane_contacts(&pdb, &components);
+        let entry = entries
+            .iter()
+            .find(|e| {
+                e.bgn.label_comp_id == "TRP"
+                    && e.bgn.auth_seq_id == 5
+                    && e.end.label_comp_id == "TRP"
+                    && e.end.auth_seq_id == 16
+                    && e.bgn.auth_atom_id == "CD1,CD2,CE2,CG,NE1"
+                    && e.end.auth_atom_id == "CD1,CD2,CE2,CG,NE1"
+            })
+            .expect("TRP5's pyrrole ring <-> TRP16's pyrrole ring should be a real contact");
+
+        assert_eq!(entry.entry_type, "plane-plane");
+        assert_eq!(entry.distance, 5.58);
+        assert_eq!(entry.contact, vec!["EF"]);
+        assert_eq!(entry.interacting_entities, "INTRA_SELECTION");
+    }
+
+    #[test]
+    fn a_real_amide_amide_contact_matches_rings_rs_own_worked_example() {
+        // ASN67 <-> GLN92, AMIDEAMIDE, 4.23A -- same real pair `rings.rs`'s
+        // own amide-amide test uses.
+        let (pdb, _errors) =
+            pdbtbx::open("../../tests/fixtures/structures/1CA2.cif").expect("1CA2 should load");
+        let components = common_components();
+
+        let entries = export_group_group_contacts(&pdb, &components);
+        let entry = entries
+            .iter()
+            .find(|e| {
+                e.bgn.label_comp_id == "ASN"
+                    && e.bgn.auth_seq_id == 67
+                    && e.end.label_comp_id == "GLN"
+                    && e.end.auth_seq_id == 92
+            })
+            .expect("ASN67 <-> GLN92 should be a real amide-amide contact");
+
+        assert_eq!(entry.entry_type, "group-group");
+        assert_eq!(entry.distance, 4.23);
+        assert_eq!(entry.contact, vec!["AMIDEAMIDE"]);
+        assert_eq!(entry.bgn.auth_atom_id, "CB,CG,ND2,OD1");
+        assert_eq!(entry.end.auth_atom_id, "CD,CG,NE2,OE1");
+    }
+
+    #[test]
+    fn a_real_carbon_pi_atom_plane_contact_is_found_in_1ca2() {
+        // PRO201's ring atoms sitting close to TRP5's pyrrole face --
+        // confirmed via an ad-hoc probe before writing this test (83 real
+        // atom-plane entries in 1CA2 alone; this is the first).
+        let (pdb, _errors) =
+            pdbtbx::open("../../tests/fixtures/structures/1CA2.cif").expect("1CA2 should load");
+        let components = common_components();
+
+        let entries = export_atom_plane_contacts(&pdb, &components);
+        let entry = entries
+            .iter()
+            .find(|e| {
+                e.bgn.label_comp_id == "PRO"
+                    && e.bgn.auth_seq_id == 201
+                    && e.bgn.auth_atom_id == "CB"
+                    && e.end.label_comp_id == "TRP"
+                    && e.end.auth_seq_id == 5
+                    && e.end.auth_atom_id == "CD1,CD2,CE2,CG,NE1"
+            })
+            .expect("PRO201 CB <-> TRP5's pyrrole ring should be a real atom-plane contact");
+
+        assert_eq!(entry.entry_type, "atom-plane");
+        assert_eq!(entry.distance, 3.99);
+        assert_eq!(entry.contact, vec!["CARBONPI"]);
+    }
+
+    #[test]
+    fn hem_only_contributes_its_two_flagged_pyrrole_rings_a_real_documented_limitation() {
+        // See this module's own doc comment: HEM's real CCD entry flags
+        // aromaticity inconsistently across its own four chemically
+        // equivalent pyrrole rings -- rings A and C are flagged, B and D
+        // aren't -- so this project's flag-based ring perception sees only
+        // 2 of HEM's 4 real rings, unlike real pdbe-arpeggio's
+        // OpenBabel-based re-perception (which golden fixture 1MBO.json's
+        // own real CARBONPI-against-ring-B entry confirms treats all four
+        // consistently). This test pins the real, precise shape of that
+        // gap down rather than leaving it as an unverified claim in a
+        // comment.
+        let hem_component = rspeggio_ccd::parser::load_ccd_component("tests/fixtures/ccd/HEM.cif")
+            .expect("HEM fixture should parse");
+
+        let mut ring_atom_sets: Vec<Vec<String>> = rings::perceive_rings(&hem_component)
+            .into_iter()
+            .map(|r| {
+                let mut ids = r.atom_ids;
+                ids.sort();
+                ids
+            })
+            .collect();
+        ring_atom_sets.sort();
+
+        assert_eq!(
+            ring_atom_sets,
+            vec![
+                vec!["C1A", "C2A", "C3A", "C4A", "NA"],
+                vec!["C1C", "C2C", "C3C", "C4C", "NC"],
+            ],
+            "expected exactly HEM's flagged A and C pyrrole rings, not its unflagged B/D ones"
+        );
+    }
+
+    #[test]
+    fn export_all_contacts_combines_every_real_contact_type() {
+        let (pdb, _errors) =
+            pdbtbx::open("../../tests/fixtures/structures/1CA2.cif").expect("1CA2 should load");
+        let mut components = common_components();
+        let zn =
+            rspeggio_ccd::parser::load_ccd_component("../rspeggio-ccd/tests/fixtures/ZN_ideal.cif")
+                .expect("ZN fixture should parse");
+        components.insert("ZN".to_string(), zn);
+
+        let entries = export_all_contacts(&pdb, &components).expect("1CA2 should export");
+
+        let mut seen_types: Vec<&str> = entries
+            .iter()
+            .map(|e| match e {
+                ContactJson::AtomAtom(_) => "atom-atom",
+                ContactJson::Group(g) => g.entry_type,
+                ContactJson::AtomPlane(_) => "atom-plane",
+            })
+            .collect();
+        seen_types.sort_unstable();
+        seen_types.dedup();
+
+        // group-plane happens not to occur anywhere in 1CA2 (confirmed via
+        // the same ad-hoc probe as the other tests above), so it's
+        // deliberately not asserted for here.
+        for expected in ["atom-atom", "plane-plane", "atom-plane", "group-group"] {
+            assert!(
+                seen_types.contains(&expected),
+                "expected at least one real {expected} contact in the combined export, got types {seen_types:?}"
+            );
+        }
     }
 }
