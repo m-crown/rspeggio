@@ -117,7 +117,7 @@ pub struct AtomPlaneContactJson {
 // here matches `FeatureBits`' own declared bit order exactly (both are the
 // same real SIFt position order), so this list doubles as a decode table
 // for the bitflags themselves.
-const FEATURE_LABELS: &[(FeatureBits, &str)] = &[
+pub(crate) const FEATURE_LABELS: &[(FeatureBits, &str)] = &[
     (FeatureBits::HBOND, "hbond"),
     (FeatureBits::WEAK_HBOND, "weak_hbond"),
     (FeatureBits::XBOND, "xbond"),

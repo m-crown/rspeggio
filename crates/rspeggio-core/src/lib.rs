@@ -7,6 +7,7 @@ pub mod join;
 pub mod rings;
 pub mod selection;
 pub mod typing;
+pub mod unsatisfied;
 
 pub fn add(left: u64, right: u64) -> u64 {
     left + right
