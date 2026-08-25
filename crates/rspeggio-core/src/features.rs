@@ -22,10 +22,12 @@
 // notably backbone amide N-H, which needs the previous residue's real C
 // (a cross-residue lookup this module doesn't attempt), and water, which
 // `hydrogenate`'s own module doc explains needs a different mechanism
-// entirely. XBOND (halogen bond donor/acceptor) isn't typed yet, so it's
-// still not covered here.
+// entirely. XBOND (halogen bond) needs its own real donor-side geometry
+// check too -- a directional C-X...acceptor angle, not a donor-hydrogen
+// one, since a halogen-bond "donor" has no hydrogen at all -- see
+// `xbond_donor_reaches_acceptor_by_angle` below.
 
-use crate::config::{self, FeatureBits};
+use crate::config::{self, DistanceCategory, FeatureBits};
 use crate::contacts::{euclidean_distance, Contact};
 use crate::hydrogenate::{self, Hybridization};
 use crate::join::join_atom;
@@ -257,6 +259,30 @@ fn donor_reaches_acceptor_by_angle(
     }))
 }
 
+// Real pdbe-arpeggio's `is_xbond` (`utils.py`): the C-X...acceptor angle,
+// where the donor is a halogen (no hydrogen involved at all -- unlike
+// `donor_reaches_acceptor_by_angle`, this needs the donor's own single
+// real covalent neighbor, not a placed hydrogen). `None` if that neighbor
+// isn't resolved in this residue.
+fn xbond_donor_reaches_acceptor_by_angle(donor: &TypedAtom, acceptor_pos: Point) -> Option<bool> {
+    let donor_ccd = donor.ccd_atom?;
+    let donor_component = donor.component?;
+    let donor_pos = donor.hierarchy.atom().pos();
+
+    let (neighbor_ccd, _) = typing::bonded_neighbors(donor_ccd, donor_component)
+        .into_iter()
+        .next()?; // an XBOND_DONOR halogen has exactly one (X1) neighbor
+    let neighbor_pos = donor
+        .hierarchy
+        .residue()
+        .atoms()
+        .find(|a| a.name() == neighbor_ccd.atom_id())
+        .map(|a| a.pos())?;
+
+    let theta = hydrogenate::angle_degrees(neighbor_pos, donor_pos, acceptor_pos);
+    Some(theta >= config::XBOND.angle_theta_1_degrees)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn classify_hbond_like(
     a1: &TypedAtom,
@@ -291,8 +317,7 @@ fn classify_hbond_like(
     false
 }
 
-// Classifies every distance-and-typing feature contact for one atom pair
-// (all of them except XBOND, which isn't typed yet).
+// Classifies every distance-and-typing feature contact for one atom pair.
 pub fn classify_features(
     contact: &Contact,
     components: &HashMap<String, CcdComponent>,
@@ -373,6 +398,26 @@ pub fn classify_features(
         config::WEAK_HBOND.angle_degrees,
     ) {
         features |= FeatureBits::WEAK_HBOND;
+    }
+
+    // XBOND: real pdbe-arpeggio gates this on the same van-der-Waals
+    // distance boundary `contacts::classify_distance` already computed for
+    // `contact.category` (`distance <= sum_vdw_radii + vdw_comp`,
+    // `interactions.py:887`) -- i.e. anything that isn't `Proximal`.
+    if contact.category != DistanceCategory::Proximal {
+        for (donor, acceptor) in [(&a1, &a2), (&a2, &a1)] {
+            if !donor.bits.contains(AtomTypeBits::XBOND_DONOR)
+                || !acceptor.bits.contains(AtomTypeBits::HBOND_ACCEPTOR)
+            {
+                continue;
+            }
+            if xbond_donor_reaches_acceptor_by_angle(donor, acceptor.hierarchy.atom().pos())
+                == Some(true)
+            {
+                features |= FeatureBits::XBOND;
+                break;
+            }
+        }
     }
 
     features
@@ -480,6 +525,35 @@ mod tests {
             .iter()
             .any(|c| classify_features(c, &components).contains(FeatureBits::AROMATIC));
         assert!(found, "expected at least one real aromatic contact in 1CA2");
+    }
+
+    #[test]
+    fn a_real_halogen_bond_is_found_in_3g4w() {
+        // 3G4W: a T4-lysozyme-cavity-style structure (myoglobin cavity
+        // mutant) with real bound chlorobenzene (comp_id 8CL, the same CCD
+        // fixture `typing.rs`'s organohalogen/xbond-donor tests already
+        // use) -- fetched specifically because none of this crate's other
+        // structure fixtures contain any covalently-bonded halogen at all,
+        // so XBOND had no real occurrence to test against otherwise. Its
+        // real Cl6 sits ~3.15-3.19A from ASN32's real backbone carbonyl
+        // oxygen, confirmed (via an ad-hoc probe before writing this test)
+        // to satisfy the real C-Cl...O angle threshold too, not just the
+        // distance.
+        let (pdb, _errors) =
+            pdbtbx::open("../../tests/fixtures/structures/3G4W.cif").expect("3G4W should load");
+        let mut components = common_components();
+        let cl_component = rspeggio_ccd::parser::load_ccd_component("tests/fixtures/ccd/8CL.cif")
+            .expect("8CL fixture should parse");
+        components.insert("8CL".to_string(), cl_component);
+        let contacts = find_contacts(&pdb, config::CONTACT_TYPES_MAX_DIST);
+
+        let found = contacts
+            .iter()
+            .any(|c| classify_features(c, &components).contains(FeatureBits::XBOND));
+        assert!(
+            found,
+            "expected at least one real halogen bond between 8CL's chlorine and a real acceptor in 3G4W"
+        );
     }
 
     #[test]

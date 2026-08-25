@@ -29,6 +29,7 @@ bitflags! {
         const CARBONYL_OXYGEN     = 1 << 8;
         const CARBONYL_CARBON     = 1 << 9;
         const METAL               = 1 << 10;
+        const XBOND_DONOR         = 1 << 11;
     }
 }
 
@@ -253,6 +254,22 @@ pub fn type_atom(atom: &CcdAtom, component: &CcdComponent) -> AtomTypeBits {
         && neighbors.iter().any(|(other, _)| other.element() == "C");
     if bits.contains(AtomTypeBits::HBOND_ACCEPTOR) || is_organohalogen {
         bits |= AtomTypeBits::WEAK_HBOND_ACCEPTOR;
+    }
+
+    // Halogen-bond (xbond) donor: real pdbe-arpeggio's own SMARTS,
+    // `[Cl,Br,I;X1;$([Cl,Br,I]-[#6])]` -- a monovalent (X1: exactly one
+    // bond total) chlorine/bromine/iodine attached to carbon. Deliberately
+    // narrower than `is_organohalogen` above in two ways real arpeggio
+    // itself keeps narrower: no fluorine (a C-F sigma hole isn't
+    // considered a real halogen-bond donor, unlike the broader weak-hbond
+    // lone-pair heuristic), and exactly one bond rather than merely
+    // *having* a carbon neighbor (though for a real monovalent halogen
+    // these coincide in practice).
+    if matches!(atom.element(), "CL" | "BR" | "I")
+        && neighbors.len() == 1
+        && neighbors[0].0.element() == "C"
+    {
+        bits |= AtomTypeBits::XBOND_DONOR;
     }
 
     bits
@@ -670,6 +687,31 @@ mod tests {
             !bits.contains(AtomTypeBits::HBOND_ACCEPTOR),
             "chlorine isn't in the strong-acceptor element set (O, or N with a free lone pair)"
         );
+    }
+
+    #[test]
+    fn chlorobenzenes_chlorine_is_also_a_real_xbond_donor() {
+        let component = rspeggio_ccd::parser::load_ccd_component("tests/fixtures/ccd/8CL.cif")
+            .expect("8CL fixture should parse");
+        let cl = component
+            .atoms()
+            .iter()
+            .find(|a| a.atom_id() == "CL6")
+            .expect("8CL has a CL6 chlorine bonded to the ring");
+
+        assert!(type_atom(cl, &component).contains(AtomTypeBits::XBOND_DONOR));
+    }
+
+    #[test]
+    fn a_bare_chloride_ion_is_not_an_xbond_donor() {
+        // No carbon neighbor at all -- there's no sigma hole to speak of,
+        // same reasoning as the existing weak-acceptor exclusion for the
+        // same ion.
+        let components = common_components();
+        let cl_ion = components.get("CL").expect("CL should be bundled");
+        let cl_atom = cl_ion.atoms().iter().find(|a| a.atom_id() == "CL").unwrap();
+
+        assert!(!type_atom(cl_atom, cl_ion).contains(AtomTypeBits::XBOND_DONOR));
     }
 
     #[test]

@@ -71,6 +71,16 @@ pub struct AromaticThresholds {
     pub distance: f64,
 }
 
+pub struct XbondThresholds {
+    // Real pdbe-arpeggio's `angle theta 1` (`interactions.py`'s `is_xbond`):
+    // the C-X...acceptor angle must be at least this wide (a loose,
+    // one-sided lower bound only -- real arpeggio's config also defines a
+    // `theta 2 min/max` range and a `catmap distance`, but neither is ever
+    // actually read anywhere in its own codebase, confirmed by searching
+    // it, so this only ports the threshold that's genuinely load-bearing).
+    pub angle_theta_1_degrees: f64,
+}
+
 pub const CONTACT_TYPES_MAX_DIST: f64 = 4.5;
 
 pub const HBOND: HbondThresholds = HbondThresholds {
@@ -99,6 +109,10 @@ pub const METAL: MetalThresholds = MetalThresholds { distance: 2.8 };
 // which gates the separate ring-*plane*-geometry (centroid/normal)
 // contacts in `rings.rs`, not this per-atom-pair feature bit.
 pub const AROMATIC: AromaticThresholds = AromaticThresholds { distance: 4.0 };
+
+pub const XBOND: XbondThresholds = XbondThresholds {
+    angle_theta_1_degrees: 120.0,
+};
 
 pub const MAINCHAIN_ATOMS: [&str; 5] = ["N", "C", "CA", "O", "OXT"];
 

@@ -32,9 +32,7 @@
 // `classify_ring_atom` covers the other half of real pdbe-arpeggio's ring
 // contact code (`__calculate_atom_plane_contacts`): a non-aromatic atom
 // sitting close to a ring's face -- cation-pi, donor-pi, carbon-pi
-// (weak-donor CH...pi), and methionine-sulfur-pi. `HALOGENPI` isn't
-// covered: it needs "xbond donor" atom typing, which doesn't exist yet
-// (same gap the handoff notes for `XBOND` generally).
+// (weak-donor CH...pi), halogen-pi, and methionine-sulfur-pi.
 //
 // `perceive_amide_groups`/`amide_geometry`/`classify_amide_amide`/
 // `classify_amide_ring` port the remaining ring-adjacent contact code
@@ -305,15 +303,13 @@ pub fn classify_ring_ring(
     Some((distance, kind))
 }
 
-// The 4 (of 5 real) ring-atom contact types this project can currently
-// type. Real pdbe-arpeggio also has `HALOGENPI` (a halogen-bond-donor
-// atom near a ring face) -- omitted here, not silently: it needs "xbond
-// donor" atom typing this project hasn't built (see module doc).
+// All 5 of real pdbe-arpeggio's ring-atom contact types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RingAtomInteraction {
     CarbonPi,
     CationPi,
     DonorPi,
+    HalogenPi,
     MetSulphurPi,
 }
 
@@ -367,6 +363,9 @@ pub fn classify_ring_atom(
             if atom_bits.contains(AtomTypeBits::HBOND_DONOR) {
                 interactions.push(RingAtomInteraction::DonorPi);
             }
+            if atom_bits.contains(AtomTypeBits::XBOND_DONOR) {
+                interactions.push(RingAtomInteraction::HalogenPi);
+            }
         }
     }
 
@@ -395,7 +394,7 @@ pub fn classify_ring_atom(
 // cross a residue boundary), so perceiving it would need real inter-residue
 // bond information this project doesn't build. That's a real, current
 // scope gap, not an oversight -- same shape as `hydrogenate.rs`'s water
-// gap or this module's own `HALOGENPI` gap above.
+// gap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AmideGroup {
     pub nitrogen_id: String,
@@ -933,6 +932,38 @@ mod tests {
             AtomTypeBits::AROMATIC | AtomTypeBits::WEAK_HBOND_DONOR,
         );
         assert!(interactions.is_empty());
+    }
+
+    #[test]
+    fn a_real_xbond_donor_chlorine_gets_halogenpi_near_a_rings_face() {
+        // Real chemistry (8CL, chlorobenzene's own bond graph -- the same
+        // fixture `typing.rs`'s xbond-donor tests use), placed at a
+        // synthetic but geometrically valid position near a ring's face --
+        // no fixture in this crate happens to have a real halogen sitting
+        // close enough to an aromatic ring's face for a real HALOGENPI
+        // (confirmed by an ad-hoc sweep of 3G4W, which does have a real
+        // XBOND but not a real HALOGENPI), so this combines the real typed
+        // bits with a hand-placed position the same way
+        // `an_aromatic_atom_never_gets_a_ring_atom_interaction` above does.
+        let component = rspeggio_ccd::parser::load_ccd_component("tests/fixtures/ccd/8CL.cif")
+            .expect("8CL fixture should parse");
+        let cl = component
+            .atoms()
+            .iter()
+            .find(|a| a.atom_id() == "CL6")
+            .expect("8CL has a CL6 chlorine bonded to the ring");
+        let bits = crate::typing::type_atom(cl, &component);
+        assert!(
+            bits.contains(AtomTypeBits::XBOND_DONOR),
+            "sanity check: CL6 should really be typed as an xbond donor"
+        );
+
+        let ring = RingGeometry {
+            center: (0.0, 0.0, 0.0),
+            normal: (0.0, 0.0, 1.0),
+        };
+        let interactions = classify_ring_atom(&ring, (0.0, 0.0, 3.0), "CL", "8CL", bits);
+        assert!(interactions.contains(&RingAtomInteraction::HalogenPi));
     }
 
     #[test]
