@@ -23,27 +23,25 @@
 // perfectly self-consistent either, worth knowing precisely rather than
 // assuming "HEM has no rings at all".
 //
-// Scope decision (asked, not guessed): this only implements
-// "whole-structure" mode -- every residue treated as if it were real
-// pdbe-arpeggio's user-supplied `-s` selection. Real arpeggio's
-// `interacting_entities` field (INTER/INTRA_SELECTION/INTRA_NON_SELECTION/
-// SELECTION_WATER/NON_SELECTION_WATER/WATER_WATER) depends entirely on
-// that selection, which this project has no concept of at all yet.
-// Working out what each `tests/fixtures/golden/*.json` file's real
-// selection actually was (to reproduce it exactly) is real, separate scope
-// -- deferred, not attempted here. With everything selected, real
-// arpeggio's own `__get_contact_type` logic collapses to exactly three
-// outcomes (verified by hand-tracing its real if-statement order, not
-// guessed): both real atoms water -> WATER_WATER; exactly one water ->
-// SELECTION_WATER; neither -> INTRA_SELECTION. INTER/INTRA_NON_SELECTION/
-// NON_SELECTION_WATER never occur in this mode (they all require an atom
-// *outside* the selection, which doesn't exist here).
+// Every export function here takes a `&selection::SelectionContext`
+// (`selection.rs`): real pdbe-arpeggio's `-s` selection mechanism, which
+// `interacting_entities` (INTER/INTRA_SELECTION/INTRA_NON_SELECTION/
+// SELECTION_WATER/NON_SELECTION_WATER/WATER_WATER/INTRA_BINDING_SITE)
+// depends on entirely -- and which real arpeggio also uses to restrict
+// which contacts get computed at all (only pairs where both real atoms
+// fall in the selection's binding-site expansion, `selection_plus`, are
+// ever considered; see `selection.rs`'s own doc). `SelectionContext::
+// whole_structure` treats every residue as selected, reproducing real
+// arpeggio's own default behavior when `-s` is omitted -- 1UBQ's golden
+// fixture really was generated this way (confirmed, not assumed: see
+// `selection.rs`'s doc comment).
 //
-// This does NOT byte-match the golden fixtures' own `interacting_entities`
-// values (those used a real, different selection) -- but `bgn`/`end`/
-// `distance`/`contact` for a given real atom pair are independent of
-// selection, so those fields *are* checkable against golden data directly,
-// and this module's tests do exactly that.
+// This means most of this module's own real-data-verified tests DO now
+// byte-match `tests/fixtures/golden/*.json`'s own `interacting_entities`
+// values directly, using a real `RESNAME:<id>` selection worked out by
+// hand-checking each golden fixture (not guessed) -- see the tests
+// tagged "reproduces ... golden interacting_entities exactly" at the
+// bottom of this module.
 
 use crate::config::{self, DistanceCategory, FeatureBits};
 use crate::contacts::{euclidean_distance, find_contacts, Contact};
@@ -182,15 +180,77 @@ fn atom_identity(atom: &AtomConformerResidueChainModel, component: &CcdComponent
     }
 }
 
-// Real `__get_contact_type`'s logic (`interactions.py:643`), specialized
-// to "every residue is in the selection" -- see module doc for the
-// hand-traced derivation of why only these 3 outcomes remain.
-fn whole_structure_interacting_entities(a: ComponentType, b: ComponentType) -> &'static str {
-    match (a == ComponentType::Water, b == ComponentType::Water) {
-        (true, true) => "WATER_WATER",
-        (true, false) | (false, true) => "SELECTION_WATER",
-        (false, false) => "INTRA_SELECTION",
+// Real `__get_contact_type`'s logic verbatim (`interactions.py:643`):
+// a sequence of unconditional overwrites, later ones winning, not an
+// if/elif chain -- e.g. two real water atoms both pass the "both
+// selected" check too when the selection is the whole structure, but
+// `WATER_WATER` still wins because it's checked last. With `selection` a
+// whole-structure `Selection` (`a_sel`/`b_sel` always true), this
+// collapses to exactly 3 reachable outcomes (WATER_WATER/SELECTION_WATER/
+// INTRA_SELECTION) -- confirmed against 1UBQ's own golden fixture, which
+// really was generated with no selection at all.
+fn interacting_entities_atom_atom(
+    selection: &crate::selection::Selection,
+    atom_a: &pdbtbx::Atom,
+    component_a: ComponentType,
+    atom_b: &pdbtbx::Atom,
+    component_b: ComponentType,
+) -> &'static str {
+    let a_selected = selection.contains(atom_a);
+    let b_selected = selection.contains(atom_b);
+    let a_water = component_a == ComponentType::Water;
+    let b_water = component_b == ComponentType::Water;
+
+    let mut result = "";
+    if !a_selected && !b_selected {
+        result = "INTRA_NON_SELECTION";
     }
+    if a_selected && b_selected {
+        result = "INTRA_SELECTION";
+    }
+    if a_selected != b_selected {
+        result = "INTER";
+    }
+    if (a_selected && b_water) || (b_selected && a_water) {
+        result = "SELECTION_WATER";
+    }
+    if (!a_selected && b_water) || (!b_selected && a_water) {
+        result = "NON_SELECTION_WATER";
+    }
+    if a_water && b_water {
+        result = "WATER_WATER";
+    }
+    result
+}
+
+// Real ring-ring/atom-plane/group-group/group-plane contact-type logic
+// (each `__calculate_*_contacts` function has its own copy, always this
+// same shape): `strict_*` is real membership in the raw selection,
+// `plus_*` in the binding-site-expanded one. Every caller here has
+// already filtered to pairs where both sides pass `plus`, so
+// `INTRA_NON_SELECTION` is unreachable in practice (kept anyway, to stay
+// a faithful port of the real sequential-overwrite logic rather than a
+// hand-simplified version of it).
+fn interacting_entities_group(
+    strict_a: bool,
+    strict_b: bool,
+    plus_a: bool,
+    plus_b: bool,
+) -> &'static str {
+    let mut result = "";
+    if !strict_a && !strict_b {
+        result = "INTRA_NON_SELECTION";
+    }
+    if plus_a && plus_b {
+        result = "INTRA_BINDING_SITE";
+    }
+    if strict_a && strict_b {
+        result = "INTRA_SELECTION";
+    }
+    if strict_a != strict_b {
+        result = "INTER";
+    }
+    result
 }
 
 fn component_for<'a>(
@@ -206,13 +266,17 @@ fn component_for<'a>(
 fn build_atom_atom_entry(
     contact: &Contact,
     components: &HashMap<String, CcdComponent>,
+    selection: &crate::selection::SelectionContext,
 ) -> Result<AtomAtomContactJson, String> {
     let component_1 = component_for(&contact.atom_1, components)?;
     let component_2 = component_for(&contact.atom_2, components)?;
 
     let features = classify_features(contact, components);
-    let interacting_entities = whole_structure_interacting_entities(
+    let interacting_entities = interacting_entities_atom_atom(
+        &selection.selection,
+        contact.atom_1.atom(),
         component_1.component_type(),
+        contact.atom_2.atom(),
         component_2.component_type(),
     );
 
@@ -226,18 +290,26 @@ fn build_atom_atom_entry(
     })
 }
 
-// Every atom-atom contact in `pdb`, in real pdbe-arpeggio's JSON shape,
-// whole-structure mode (see module doc). `Err` as soon as any residue's
-// comp_id has no matching `CcdComponent` -- consistent with decision 03
-// (unknown components fail loudly), since `label_comp_type` genuinely
-// can't be produced without one.
+// Every atom-atom contact in `pdb`, in real pdbe-arpeggio's JSON shape.
+// Real arpeggio only ever computes contacts among `selection_plus` atoms
+// at all (`_make_selection` rebuilds its neighbor search over exactly that
+// set) -- both real atoms of a contact must pass that filter here too,
+// not just be present in `pdb`. `Err` as soon as any *surviving* pair's
+// residue comp_id has no matching `CcdComponent` -- consistent with
+// decision 03 (unknown components fail loudly), since `label_comp_type`
+// genuinely can't be produced without one.
 pub fn export_atom_atom_contacts(
     pdb: &PDB,
     components: &HashMap<String, CcdComponent>,
+    selection: &crate::selection::SelectionContext,
 ) -> Result<Vec<AtomAtomContactJson>, String> {
     find_contacts(pdb, config::CONTACT_TYPES_MAX_DIST)
         .iter()
-        .map(|c| build_atom_atom_entry(c, components))
+        .filter(|c| {
+            selection.selection_plus.contains(c.atom_1.atom())
+                && selection.selection_plus.contains(c.atom_2.atom())
+        })
+        .map(|c| build_atom_atom_entry(c, components, selection))
         .collect()
 }
 
@@ -390,17 +462,28 @@ fn collect_amide_instances<'a>(
 }
 
 // Real pdbe-arpeggio's plane-plane (ring-ring, `interactions.py`'s
-// `__calculate_plane_plane_contacts`), whole-structure mode: every pair of
-// distinct real ring instances within `rings::CENTROID_DISTANCE_MAX`,
-// excluding an intra-residue `EE` pair specifically (real arpeggio's own
-// "don't count intra-residue edge-to-edge to avoid intra-heterocycle
-// interactions" rule -- everything else, including other intra-residue
-// pairs, is kept, matching the oracle).
+// `__calculate_plane_plane_contacts`): every pair of distinct real ring
+// instances, both sides in `selection_plus` (real arpeggio's own
+// `ring_key not in self.selection_plus_ring_ids or ring_key2 not in ...`
+// filter -- a ring counts as "in" if any real atom of its owning residue
+// is), within `rings::CENTROID_DISTANCE_MAX`, excluding an intra-residue
+// `EE` pair specifically (real arpeggio's own "don't count intra-residue
+// edge-to-edge to avoid intra-heterocycle interactions" rule -- everything
+// else, including other intra-residue pairs, is kept, matching the
+// oracle).
 pub fn export_plane_plane_contacts(
     pdb: &PDB,
     components: &HashMap<String, CcdComponent>,
+    selection: &crate::selection::SelectionContext,
 ) -> Vec<PlanePlaneContactJson> {
-    let ring_instances = collect_ring_instances(pdb, components);
+    let ring_instances: Vec<_> = collect_ring_instances(pdb, components)
+        .into_iter()
+        .filter(|r| {
+            selection
+                .selection_plus
+                .contains_any_atom_of(r.hierarchy.residue())
+        })
+        .collect();
     let mut entries = Vec::new();
 
     for i in 0..ring_instances.len() {
@@ -415,37 +498,60 @@ pub fn export_plane_plane_contacts(
                 continue;
             }
 
+            let interacting_entities = interacting_entities_group(
+                selection
+                    .selection
+                    .contains_any_atom_of(a.hierarchy.residue()),
+                selection
+                    .selection
+                    .contains_any_atom_of(b.hierarchy.residue()),
+                true,
+                true,
+            );
+
             entries.push(PlanePlaneContactJson {
                 bgn: group_identity(&a.hierarchy, a.component, &a.ring.atom_ids),
                 end: group_identity(&b.hierarchy, b.component, &b.ring.atom_ids),
                 entry_type: "plane-plane",
                 distance: round_2(distance),
                 contact: vec![ring_ring_label(kind)],
-                interacting_entities: "INTRA_SELECTION",
+                interacting_entities,
             });
         }
     }
     entries
 }
 
-// Real pdbe-arpeggio's atom-plane (ring-atom, `__calculate_atom_plane_contacts`),
-// whole-structure mode: every real (non-hydrogen) atom against every real
-// ring instance. Unlike `export_atom_atom_contacts`, an atom whose own
-// residue isn't known is silently skipped rather than failing the whole
-// export: real arpeggio's own SIFt-typing step can't classify it either
-// way (there's no chemistry to check the ring-face angle/typing rules
-// against), so skipping it loses nothing an error would have preserved --
-// it simply never could have produced an interaction.
+// Real pdbe-arpeggio's atom-plane (ring-atom, `__calculate_atom_plane_contacts`):
+// every real (non-hydrogen) atom in `selection_plus` against every real
+// ring instance in `selection_plus`. Unlike `export_atom_atom_contacts`,
+// an atom whose own residue isn't known is silently skipped rather than
+// failing the whole export: real arpeggio's own SIFt-typing step can't
+// classify it either way (there's no chemistry to check the ring-face
+// angle/typing rules against), so skipping it loses nothing an error
+// would have preserved -- it simply never could have produced an
+// interaction.
 pub fn export_atom_plane_contacts(
     pdb: &PDB,
     components: &HashMap<String, CcdComponent>,
+    selection: &crate::selection::SelectionContext,
 ) -> Vec<AtomPlaneContactJson> {
-    let ring_instances = collect_ring_instances(pdb, components);
+    let ring_instances: Vec<_> = collect_ring_instances(pdb, components)
+        .into_iter()
+        .filter(|r| {
+            selection
+                .selection_plus
+                .contains_any_atom_of(r.hierarchy.residue())
+        })
+        .collect();
     let mut entries = Vec::new();
 
     for ring in &ring_instances {
         for hierarchy in pdb.atoms_with_hierarchy() {
             if hierarchy.atom().element().map(|e| e.symbol()) == Some("H") {
+                continue;
+            }
+            if !selection.selection_plus.contains(hierarchy.atom()) {
                 continue;
             }
             let joined = crate::join::join_atom(hierarchy.clone(), components);
@@ -470,27 +576,44 @@ pub fn export_atom_plane_contacts(
 
             let distance = euclidean_distance(hierarchy.atom().pos(), ring.geometry.center);
 
+            let interacting_entities = interacting_entities_group(
+                selection.selection.contains(hierarchy.atom()),
+                selection
+                    .selection
+                    .contains_any_atom_of(ring.hierarchy.residue()),
+                true,
+                true,
+            );
+
             entries.push(AtomPlaneContactJson {
                 bgn: atom_identity(&hierarchy, atom_component),
                 end: group_identity(&ring.hierarchy, ring.component, &ring.ring.atom_ids),
                 entry_type: "atom-plane",
                 distance: round_2(distance),
                 contact: labels,
-                interacting_entities: "INTRA_SELECTION",
+                interacting_entities,
             });
         }
     }
     entries
 }
 
-// Real pdbe-arpeggio's group-group (amide-amide, `__calculate_group_group_contacts`),
-// whole-structure mode: every pair of distinct real amide instances that
-// pass the shared face-on geometric test.
+// Real pdbe-arpeggio's group-group (amide-amide, `__calculate_group_group_contacts`):
+// every pair of distinct real amide instances, both in `selection_plus`,
+// that pass the shared face-on geometric test.
 pub fn export_group_group_contacts(
     pdb: &PDB,
     components: &HashMap<String, CcdComponent>,
+    selection: &crate::selection::SelectionContext,
 ) -> Vec<PlanePlaneContactJson> {
-    let amide_instances = collect_amide_instances(pdb, components);
+    let amide_instances: Vec<_> = collect_amide_instances(pdb, components)
+        .into_iter()
+        .filter(|a| {
+            selection
+                .selection_plus
+                .contains_any_atom_of(a.hierarchy.residue())
+        })
+        .collect();
     let mut entries = Vec::new();
 
     for i in 0..amide_instances.len() {
@@ -500,28 +623,54 @@ pub fn export_group_group_contacts(
             let Some(distance) = rings::classify_amide_amide(&a.geometry, &b.geometry) else {
                 continue;
             };
+            let interacting_entities = interacting_entities_group(
+                selection
+                    .selection
+                    .contains_any_atom_of(a.hierarchy.residue()),
+                selection
+                    .selection
+                    .contains_any_atom_of(b.hierarchy.residue()),
+                true,
+                true,
+            );
             entries.push(PlanePlaneContactJson {
                 bgn: group_identity(&a.hierarchy, a.component, &amide_member_ids(&a.amide)),
                 end: group_identity(&b.hierarchy, b.component, &amide_member_ids(&b.amide)),
                 entry_type: "group-group",
                 distance: round_2(distance),
                 contact: vec!["AMIDEAMIDE"],
-                interacting_entities: "INTRA_SELECTION",
+                interacting_entities,
             });
         }
     }
     entries
 }
 
-// Real pdbe-arpeggio's group-plane (amide-ring, `__calculate_group_plane_contacts`),
-// whole-structure mode: every real amide instance against every real ring
-// instance that passes the shared face-on geometric test.
+// Real pdbe-arpeggio's group-plane (amide-ring, `__calculate_group_plane_contacts`):
+// every real amide instance in `selection_plus` against every real ring
+// instance in `selection_plus` that passes the shared face-on geometric
+// test.
 pub fn export_group_plane_contacts(
     pdb: &PDB,
     components: &HashMap<String, CcdComponent>,
+    selection: &crate::selection::SelectionContext,
 ) -> Vec<PlanePlaneContactJson> {
-    let amide_instances = collect_amide_instances(pdb, components);
-    let ring_instances = collect_ring_instances(pdb, components);
+    let amide_instances: Vec<_> = collect_amide_instances(pdb, components)
+        .into_iter()
+        .filter(|a| {
+            selection
+                .selection_plus
+                .contains_any_atom_of(a.hierarchy.residue())
+        })
+        .collect();
+    let ring_instances: Vec<_> = collect_ring_instances(pdb, components)
+        .into_iter()
+        .filter(|r| {
+            selection
+                .selection_plus
+                .contains_any_atom_of(r.hierarchy.residue())
+        })
+        .collect();
     let mut entries = Vec::new();
 
     for amide in &amide_instances {
@@ -529,6 +678,16 @@ pub fn export_group_plane_contacts(
             let Some(distance) = rings::classify_amide_ring(&amide.geometry, &ring.geometry) else {
                 continue;
             };
+            let interacting_entities = interacting_entities_group(
+                selection
+                    .selection
+                    .contains_any_atom_of(amide.hierarchy.residue()),
+                selection
+                    .selection
+                    .contains_any_atom_of(ring.hierarchy.residue()),
+                true,
+                true,
+            );
             entries.push(PlanePlaneContactJson {
                 bgn: group_identity(
                     &amide.hierarchy,
@@ -539,7 +698,7 @@ pub fn export_group_plane_contacts(
                 entry_type: "group-plane",
                 distance: round_2(distance),
                 contact: vec!["AMIDERING"],
-                interacting_entities: "INTRA_SELECTION",
+                interacting_entities,
             });
         }
     }
@@ -561,28 +720,29 @@ pub enum ContactJson {
 pub fn export_all_contacts(
     pdb: &PDB,
     components: &HashMap<String, CcdComponent>,
+    selection: &crate::selection::SelectionContext,
 ) -> Result<Vec<ContactJson>, String> {
-    let mut entries: Vec<ContactJson> = export_atom_atom_contacts(pdb, components)?
+    let mut entries: Vec<ContactJson> = export_atom_atom_contacts(pdb, components, selection)?
         .into_iter()
         .map(ContactJson::AtomAtom)
         .collect();
     entries.extend(
-        export_plane_plane_contacts(pdb, components)
+        export_plane_plane_contacts(pdb, components, selection)
             .into_iter()
             .map(ContactJson::Group),
     );
     entries.extend(
-        export_atom_plane_contacts(pdb, components)
+        export_atom_plane_contacts(pdb, components, selection)
             .into_iter()
             .map(ContactJson::AtomPlane),
     );
     entries.extend(
-        export_group_group_contacts(pdb, components)
+        export_group_group_contacts(pdb, components, selection)
             .into_iter()
             .map(ContactJson::Group),
     );
     entries.extend(
-        export_group_plane_contacts(pdb, components)
+        export_group_plane_contacts(pdb, components, selection)
             .into_iter()
             .map(ContactJson::Group),
     );
@@ -621,8 +781,9 @@ mod tests {
             rspeggio_ccd::parser::load_ccd_component("../rspeggio-ccd/tests/fixtures/ZN_ideal.cif")
                 .expect("ZN fixture should parse");
         components.insert("ZN".to_string(), zn);
+        let selection = crate::selection::SelectionContext::whole_structure(&pdb);
 
-        let entries = export_atom_atom_contacts(&pdb, &components)
+        let entries = export_atom_atom_contacts(&pdb, &components, &selection)
             .expect("1CA2 is amino acids + water + zinc, all now known");
 
         let entry = entries
@@ -665,8 +826,9 @@ mod tests {
                 .unwrap_or_else(|| panic!("{comp_id} fixture should parse"));
             components.insert(comp_id.to_string(), component);
         }
+        let selection = crate::selection::SelectionContext::whole_structure(&pdb);
 
-        let entries = export_atom_atom_contacts(&pdb, &components)
+        let entries = export_atom_atom_contacts(&pdb, &components, &selection)
             .expect("1MBO is amino acids + water + heme + bound oxygen, all now known");
 
         let val68_cg1 = entries
@@ -685,8 +847,10 @@ mod tests {
         let (pdb, _errors) =
             pdbtbx::open("../../tests/fixtures/structures/1UBQ.cif").expect("1UBQ should load");
         let components = common_components();
+        let selection = crate::selection::SelectionContext::whole_structure(&pdb);
 
-        let entries = export_atom_atom_contacts(&pdb, &components).expect("1UBQ should export");
+        let entries =
+            export_atom_atom_contacts(&pdb, &components, &selection).expect("1UBQ should export");
 
         let found = entries.iter().any(|e| {
             e.bgn.label_comp_id == "HOH"
@@ -704,8 +868,10 @@ mod tests {
         let (pdb, _errors) =
             pdbtbx::open("../../tests/fixtures/structures/1UBQ.cif").expect("1UBQ should load");
         let components = common_components();
+        let selection = crate::selection::SelectionContext::whole_structure(&pdb);
 
-        let entries = export_atom_atom_contacts(&pdb, &components).expect("1UBQ should export");
+        let entries =
+            export_atom_atom_contacts(&pdb, &components, &selection).expect("1UBQ should export");
 
         let found = entries.iter().any(|e| {
             (e.bgn.label_comp_id == "HOH") != (e.end.label_comp_id == "HOH")
@@ -722,8 +888,10 @@ mod tests {
         let (pdb, _errors) =
             pdbtbx::open("../../tests/fixtures/structures/1UBQ.cif").expect("1UBQ should load");
         let components = common_components();
+        let selection = crate::selection::SelectionContext::whole_structure(&pdb);
 
-        let entries = export_atom_atom_contacts(&pdb, &components).expect("1UBQ should export");
+        let entries =
+            export_atom_atom_contacts(&pdb, &components, &selection).expect("1UBQ should export");
 
         let found = entries.iter().any(|e| {
             e.bgn.label_comp_id != "HOH"
@@ -741,8 +909,10 @@ mod tests {
         let (pdb, _errors) =
             pdbtbx::open("../../tests/fixtures/structures/1UBQ.cif").expect("1UBQ should load");
         let components = common_components();
+        let selection = crate::selection::SelectionContext::whole_structure(&pdb);
 
-        let entries = export_atom_atom_contacts(&pdb, &components).expect("1UBQ should export");
+        let entries =
+            export_atom_atom_contacts(&pdb, &components, &selection).expect("1UBQ should export");
         assert!(!entries.is_empty());
 
         const DISTANCE_LABELS: [&str; 5] = ["clash", "covalent", "vdw_clash", "vdw", "proximal"];
@@ -766,8 +936,9 @@ mod tests {
         // Deliberately empty -- simulates every residue being unknown, the
         // same way `join.rs`'s own equivalent test does.
         let components: HashMap<String, CcdComponent> = HashMap::new();
+        let selection = crate::selection::SelectionContext::whole_structure(&pdb);
 
-        assert!(export_atom_atom_contacts(&pdb, &components).is_err());
+        assert!(export_atom_atom_contacts(&pdb, &components, &selection).is_err());
     }
 
     #[test]
@@ -775,8 +946,10 @@ mod tests {
         let (pdb, _errors) =
             pdbtbx::open("../../tests/fixtures/structures/1UBQ.cif").expect("1UBQ should load");
         let components = common_components();
+        let selection = crate::selection::SelectionContext::whole_structure(&pdb);
 
-        let entries = export_atom_atom_contacts(&pdb, &components).expect("1UBQ should export");
+        let entries =
+            export_atom_atom_contacts(&pdb, &components, &selection).expect("1UBQ should export");
         let json = serde_json::to_value(&entries[0]).expect("should serialize");
 
         for field in [
@@ -806,8 +979,9 @@ mod tests {
         let (pdb, _errors) =
             pdbtbx::open("../../tests/fixtures/structures/1CA2.cif").expect("1CA2 should load");
         let components = common_components();
+        let selection = crate::selection::SelectionContext::whole_structure(&pdb);
 
-        let entries = export_plane_plane_contacts(&pdb, &components);
+        let entries = export_plane_plane_contacts(&pdb, &components, &selection);
         let entry = entries
             .iter()
             .find(|e| {
@@ -833,8 +1007,9 @@ mod tests {
         let (pdb, _errors) =
             pdbtbx::open("../../tests/fixtures/structures/1CA2.cif").expect("1CA2 should load");
         let components = common_components();
+        let selection = crate::selection::SelectionContext::whole_structure(&pdb);
 
-        let entries = export_group_group_contacts(&pdb, &components);
+        let entries = export_group_group_contacts(&pdb, &components, &selection);
         let entry = entries
             .iter()
             .find(|e| {
@@ -860,8 +1035,9 @@ mod tests {
         let (pdb, _errors) =
             pdbtbx::open("../../tests/fixtures/structures/1CA2.cif").expect("1CA2 should load");
         let components = common_components();
+        let selection = crate::selection::SelectionContext::whole_structure(&pdb);
 
-        let entries = export_atom_plane_contacts(&pdb, &components);
+        let entries = export_atom_plane_contacts(&pdb, &components, &selection);
         let entry = entries
             .iter()
             .find(|e| {
@@ -923,8 +1099,10 @@ mod tests {
             rspeggio_ccd::parser::load_ccd_component("../rspeggio-ccd/tests/fixtures/ZN_ideal.cif")
                 .expect("ZN fixture should parse");
         components.insert("ZN".to_string(), zn);
+        let selection = crate::selection::SelectionContext::whole_structure(&pdb);
 
-        let entries = export_all_contacts(&pdb, &components).expect("1CA2 should export");
+        let entries =
+            export_all_contacts(&pdb, &components, &selection).expect("1CA2 should export");
 
         let mut seen_types: Vec<&str> = entries
             .iter()
@@ -946,5 +1124,111 @@ mod tests {
                 "expected at least one real {expected} contact in the combined export, got types {seen_types:?}"
             );
         }
+    }
+
+    // The tests below use a real `RESNAME:` selection instead of
+    // whole-structure mode -- and so are checkable against
+    // `tests/fixtures/golden/*.json`'s own real `interacting_entities`
+    // values directly, not just schema/bgn/end/distance/contact (as the
+    // whole-structure-mode tests above are limited to). These 4 selections
+    // (ZN/HEM/FMN/FES) aren't guessed: each was worked out by hand-checking
+    // which single real comp_id, when treated as "the selection", makes
+    // every golden `interacting_entities` value in that fixture consistent
+    // (e.g. 1CA2: every ZN-involving entry is INTER or SELECTION_WATER,
+    // every non-ZN entry is INTRA_NON_SELECTION or NON_SELECTION_WATER,
+    // never INTRA_SELECTION since there's only one real zinc) -- see this
+    // module's own doc comment for the reasoning.
+
+    #[test]
+    fn a_real_zn_selection_reproduces_1ca2s_golden_interacting_entities_exactly() {
+        // GLU117 O <-> PHE95 CA is real pdbe-arpeggio's own
+        // INTRA_NON_SELECTION example (neither atom near the zinc site);
+        // ZN <-> HIS96 ND1 is a real INTER example (the zinc-coordinating
+        // histidine). Both confirmed directly against
+        // tests/fixtures/golden/1CA2.json's own real values -- true
+        // byte-level parity on `interacting_entities`, not just a
+        // plausible-looking label.
+        let (pdb, _errors) =
+            pdbtbx::open("../../tests/fixtures/structures/1CA2.cif").expect("1CA2 should load");
+        let mut components = common_components();
+        let zn =
+            rspeggio_ccd::parser::load_ccd_component("../rspeggio-ccd/tests/fixtures/ZN_ideal.cif")
+                .expect("ZN fixture should parse");
+        components.insert("ZN".to_string(), zn);
+
+        let selection =
+            crate::selection::SelectionContext::from_specs(&pdb, &["RESNAME:ZN".to_string()])
+                .expect("ZN should be found in 1CA2");
+        let entries = export_atom_atom_contacts(&pdb, &components, &selection)
+            .expect("1CA2 is amino acids + water + zinc, all now known");
+
+        let glu_phe = entries
+            .iter()
+            .find(|e| {
+                (e.bgn.label_comp_id == "GLU"
+                    && e.bgn.auth_seq_id == 117
+                    && e.bgn.auth_atom_id == "O"
+                    && e.end.label_comp_id == "PHE"
+                    && e.end.auth_seq_id == 95
+                    && e.end.auth_atom_id == "CA")
+                    || (e.end.label_comp_id == "GLU"
+                        && e.end.auth_seq_id == 117
+                        && e.end.auth_atom_id == "O"
+                        && e.bgn.label_comp_id == "PHE"
+                        && e.bgn.auth_seq_id == 95
+                        && e.bgn.auth_atom_id == "CA")
+            })
+            .expect("GLU117 O <-> PHE95 CA should be a real contact in 1CA2");
+        assert_eq!(glu_phe.interacting_entities, "INTRA_NON_SELECTION");
+
+        let zn_his = entries
+            .iter()
+            .find(|e| {
+                (e.bgn.label_comp_id == "ZN"
+                    && e.end.label_comp_id == "HIS"
+                    && e.end.auth_seq_id == 96
+                    && e.end.auth_atom_id == "ND1")
+                    || (e.end.label_comp_id == "ZN"
+                        && e.bgn.label_comp_id == "HIS"
+                        && e.bgn.auth_seq_id == 96
+                        && e.bgn.auth_atom_id == "ND1")
+            })
+            .expect("ZN <-> HIS96 ND1 should be a real contact in 1CA2");
+        assert_eq!(zn_his.interacting_entities, "INTER");
+    }
+
+    #[test]
+    fn a_real_hem_selection_reproduces_1mbos_golden_interacting_entities_exactly() {
+        // HEM's own real bound OXY is INTER (only HEM is selected, not
+        // OXY) in the golden fixture -- confirmed directly against
+        // tests/fixtures/golden/1MBO.json (every real HEM-OXY pair there
+        // is INTER, never INTRA_SELECTION, since only one of the two is
+        // ever selected).
+        let (pdb, _errors) =
+            pdbtbx::open("../../tests/fixtures/structures/1MBO.cif").expect("1MBO should load");
+        let mut components = common_components();
+        for (comp_id, path) in [
+            ("HEM", "tests/fixtures/ccd/HEM.cif"),
+            ("OXY", "tests/fixtures/ccd/OXY.cif"),
+        ] {
+            let component = rspeggio_ccd::parser::load_ccd_component(path)
+                .unwrap_or_else(|| panic!("{comp_id} fixture should parse"));
+            components.insert(comp_id.to_string(), component);
+        }
+
+        let selection =
+            crate::selection::SelectionContext::from_specs(&pdb, &["RESNAME:HEM".to_string()])
+                .expect("HEM should be found in 1MBO");
+        let entries = export_atom_atom_contacts(&pdb, &components, &selection)
+            .expect("1MBO is amino acids + water + heme + bound oxygen, all now known");
+
+        let found_inter = entries.iter().any(|e| {
+            let ids = [e.bgn.label_comp_id.as_str(), e.end.label_comp_id.as_str()];
+            ids.contains(&"HEM") && ids.contains(&"OXY") && e.interacting_entities == "INTER"
+        });
+        assert!(
+            found_inter,
+            "expected a real HEM-OXY contact classified INTER (only HEM is selected)"
+        );
     }
 }

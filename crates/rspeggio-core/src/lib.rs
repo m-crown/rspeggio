@@ -5,6 +5,7 @@ pub mod features;
 pub mod hydrogenate;
 pub mod join;
 pub mod rings;
+pub mod selection;
 pub mod typing;
 
 pub fn add(left: u64, right: u64) -> u64 {
