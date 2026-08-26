@@ -44,7 +44,7 @@
 // bottom of this module.
 
 use crate::config::{self, DistanceCategory, FeatureBits};
-use crate::contacts::{euclidean_distance, find_contacts, Contact};
+use crate::contacts::{euclidean_distance, find_contacts, is_sequence_adjacent, Contact};
 use crate::features::classify_features;
 use crate::rings::{
     self, AmideGeometry, AmideGroup, RingAtomInteraction, RingAtoms, RingGeometry,
@@ -444,8 +444,9 @@ fn collect_amide_instances<'a>(
     pdb: &'a PDB,
     components: &'a HashMap<String, CcdComponent>,
 ) -> Vec<AmideInstance<'a>> {
+    let residues = residue_instances(pdb);
     let mut instances = Vec::new();
-    for hierarchy in residue_instances(pdb) {
+    for hierarchy in &residues {
         let comp_id = hierarchy.residue().name().unwrap_or_default();
         let Some(component) = components.get(comp_id) else {
             continue;
@@ -461,6 +462,35 @@ fn collect_amide_instances<'a>(
             }
         }
     }
+
+    // Standard protein backbone amide (see `rings::perceive_backbone_amide`'s
+    // own doc for why this is a deliberate divergence from real arpeggio,
+    // not a parity port): every real sequence-adjacent pair `(a, b)`, `a`'s
+    // own C/O carrying the amide's identity (matches the intra-residue
+    // convention above). `is_sequence_adjacent` is symmetric, so the
+    // `a.residue().id().0 + 1 == b.residue().id().0` check picks direction.
+    for a in &residues {
+        let comp_id = a.residue().name().unwrap_or_default();
+        let Some(component) = components.get(comp_id) else {
+            continue;
+        };
+        for b in &residues {
+            if !is_sequence_adjacent(a, b) || a.residue().id().0 + 1 != b.residue().id().0 {
+                continue;
+            }
+            if let Some((amide, geometry)) =
+                rings::perceive_backbone_amide(a.residue(), b.residue())
+            {
+                instances.push(AmideInstance {
+                    hierarchy: a.clone(),
+                    component,
+                    amide,
+                    geometry,
+                });
+            }
+        }
+    }
+
     instances
 }
 
@@ -901,6 +931,46 @@ mod tests {
         assert!(
             found,
             "expected at least one real water-water contact in 1UBQ"
+        );
+    }
+
+    #[test]
+    fn a_real_backbone_amide_produces_a_group_group_contact_in_1ubq() {
+        // ASN60's side-chain amide (perceived intra-residue, as before) and
+        // ILE61's real backbone amide (the new cross-residue perceiver)
+        // form a real face-on AMIDEAMIDE pair 5.66A apart -- found by
+        // sweeping 1UBQ's whole-structure export directly, not assumed.
+        // Before `perceive_backbone_amide` existed, this pair was
+        // unreachable: `export_group_group_contacts` only ever saw
+        // side-chain amides, and there's no other side-chain amide within
+        // range in 1UBQ to pair ASN60 with.
+        let (pdb, _errors) =
+            pdbtbx::open("../../tests/fixtures/structures/1UBQ.cif").expect("1UBQ should load");
+        let components = common_components();
+        let selection = crate::selection::SelectionContext::whole_structure(&pdb);
+
+        let entries = export_group_group_contacts(&pdb, &components, &selection);
+
+        let entry = entries
+            .iter()
+            .find(|e| {
+                (e.bgn.label_comp_id == "ASN"
+                    && e.bgn.auth_seq_id == 60
+                    && e.end.label_comp_id == "ILE"
+                    && e.end.auth_seq_id == 61)
+                    || (e.end.label_comp_id == "ASN"
+                        && e.end.auth_seq_id == 60
+                        && e.bgn.label_comp_id == "ILE"
+                        && e.bgn.auth_seq_id == 61)
+            })
+            .expect("ASN60's side-chain amide and ILE61's backbone amide should be a real group-group contact");
+
+        assert_eq!(entry.entry_type, "group-group");
+        assert_eq!(entry.contact, vec!["AMIDEAMIDE"]);
+        assert!(
+            (entry.distance - 5.66).abs() < 0.01,
+            "expected ~5.66A, got {}",
+            entry.distance
         );
     }
 

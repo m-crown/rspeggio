@@ -40,12 +40,32 @@
 // `__calculate_group_plane_contacts`): amide groups are perceived the same
 // way rings are (exact bond-graph traversal, this time for real
 // pdbe-arpeggio's `AMIDE_SMARTS` shape), then classified against another
-// amide or a ring by a single face-on (not 9-way) geometric test. See
-// `AmideGroup`'s doc for the one real scope gap this has that ring
-// perception doesn't: a standard backbone peptide amide spans two
-// residues (two different `CcdComponent`s), so isn't found by this --
-// only whole-single-component amides are (side-chain ASN/GLN, and
-// incidentally nucleobase ring lactams too).
+// amide or a ring by a single face-on (not 9-way) geometric test.
+// `perceive_amide_groups` only finds amides fully contained within one
+// `CcdComponent`'s own bonds (side-chain ASN/GLN, incidentally nucleobase
+// ring lactams too) -- a standard backbone peptide amide spans two
+// residues (two different components), so it needs its own perceiver:
+// `perceive_backbone_amide`, below.
+//
+// `perceive_backbone_amide` is a deliberate divergence from real
+// pdbe-arpeggio, not a parity port -- confirmed empirically, not assumed.
+// Real arpeggio perceives amides via OpenBabel SMARTS matching over
+// OpenBabel's own automatically re-perceived whole-molecule bond graph
+// (guessed from atomic distances, no CONECT records), and that
+// bond-order perception measurably fails often enough that real arpeggio
+// itself only finds backbone amides at 1-7% of real residues across
+// every structure fixture in this repo (1UBQ 3/76, 1CA2 17/256, 1MBO
+// 4/153, 1FLV 1/168, 4FXC 2/98 -- confirmed by running real
+// `pdbe-arpeggio` directly, not guessed), which is also why none of
+// `tests/fixtures/golden/*.json` contain a single `group-group`/
+// `group-plane` entry. There is no oracle output worth matching here.
+// Standard backbone atom names (N, CA, C, O) are invariant across amino
+// acid types, so a direct fixed-name lookup across two sequence-adjacent
+// residues, gated by a real peptide-bond distance check, finds a real
+// backbone amide reliably wherever one actually exists -- deliberately
+// more complete than the oracle's own sparse detection, the same
+// principled-divergence shape as this project's carboxylate-ionisability
+// decision (see decisions list).
 
 use crate::typing::AtomTypeBits;
 use pdbtbx::Residue;
@@ -391,10 +411,9 @@ pub fn classify_ring_atom(
 // chains both are (confirmed against their real bond graphs below), but a
 // standard backbone peptide amide is *not*: its C=O and the next residue's
 // N are different components entirely (a `CcdComponent`'s bonds never
-// cross a residue boundary), so perceiving it would need real inter-residue
-// bond information this project doesn't build. That's a real, current
-// scope gap, not an oversight -- same shape as `hydrogenate.rs`'s water
-// gap.
+// cross a residue boundary). `perceive_backbone_amide`, below, handles
+// that case separately (module doc has why it's a different kind of
+// function, not just a missing feature).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AmideGroup {
     pub nitrogen_id: String,
@@ -488,6 +507,61 @@ pub fn amide_geometry(amide: &AmideGroup, residue: &Residue) -> Option<AmideGeom
     let normal = normalize(cross(subtract(o, c), subtract(n, c)));
 
     Some(AmideGeometry { center, normal })
+}
+
+// Real backbone C-N distances (confirmed against 1UBQ's 75 real
+// sequence-adjacent pairs: 1.28-1.36 A) sit comfortably under the summed
+// covalent radii, same margin `is_disulfide_bond`
+// (`contacts.rs::is_disulfide_bond`) uses for S-S. This is the load-bearing
+// chemistry gate for `perceive_backbone_amide` -- not sequence adjacency
+// alone, which can't tell a real chain break from a true peptide bond.
+fn is_peptide_bond(c: Point, n: Point) -> bool {
+    let sum_cov_radii = match (
+        crate::config::covalent_radius("C"),
+        crate::config::covalent_radius("N"),
+    ) {
+        (Some(c), Some(n)) => c + n,
+        _ => return false,
+    };
+    length(subtract(c, n)) < sum_cov_radii
+}
+
+// The standard protein backbone amide: `residue`'s own C=O, bonded via a
+// real peptide bond to `next_residue`'s N. Unlike `perceive_amide_groups`,
+// this doesn't need bond-graph traversal at all -- backbone atom naming
+// (N, CA, C, O) is invariant across every standard amino acid, so a
+// direct name lookup across the two residues is sufficient; the peptide
+// bond itself is confirmed geometrically via `is_peptide_bond`, not
+// assumed from sequence adjacency. `other_carbon_id` is `residue`'s own
+// CA, matching real arpeggio's own SMARTS match shape (see module doc)
+// even though `amide_geometry` doesn't read it. `None` if any of the
+// four real atoms is missing (disorder, real gaps) or no real peptide
+// bond exists between them (e.g. a genuine chain break that still looks
+// sequence-adjacent by residue numbering).
+pub fn perceive_backbone_amide(
+    residue: &Residue,
+    next_residue: &Residue,
+) -> Option<(AmideGroup, AmideGeometry)> {
+    let pos_in = |r: &Residue, id: &str| r.atoms().find(|a| a.name() == id).map(|a| a.pos());
+    let c = pos_in(residue, "C")?;
+    let o = pos_in(residue, "O")?;
+    pos_in(residue, "CA")?; // confirmed to exist only, matching real arpeggio's own match shape
+    let n = pos_in(next_residue, "N")?;
+
+    if !is_peptide_bond(c, n) {
+        return None;
+    }
+
+    let amide = AmideGroup {
+        nitrogen_id: "N".to_string(),
+        carbon_id: "C".to_string(),
+        oxygen_id: "O".to_string(),
+        other_carbon_id: "CA".to_string(),
+    };
+    let center = ((c.0 + n.0) / 2.0, (c.1 + n.1) / 2.0, (c.2 + n.2) / 2.0);
+    let normal = normalize(cross(subtract(o, c), subtract(n, c)));
+
+    Some((amide, AmideGeometry { center, normal }))
 }
 
 fn cross(a: Point, b: Point) -> Point {
@@ -1128,5 +1202,111 @@ mod tests {
         };
 
         assert!(classify_amide_amide(&a, &b).is_none());
+    }
+
+    #[test]
+    fn a_real_backbone_amide_is_perceived_between_1ubqs_met1_and_gln2() {
+        // Real coordinates (confirmed via BioPython against the same real
+        // `1UBQ.cif`, not fabricated): MET1's C at (26.913, 26.639, 3.531),
+        // O at (27.886, 26.463, 4.263), GLN2's N at (26.335, 27.77, 3.258)
+        // -- a real C-N distance of 1.299A, well inside real peptide-bond
+        // range.
+        let (pdb, _errors) =
+            pdbtbx::open("../../tests/fixtures/structures/1UBQ.cif").expect("1UBQ should load");
+        let met1 = pdb
+            .residues()
+            .find(|r| r.id().0 == 1 && r.name() == Some("MET"))
+            .expect("MET1 should be present in 1UBQ");
+        let gln2 = pdb
+            .residues()
+            .find(|r| r.id().0 == 2 && r.name() == Some("GLN"))
+            .expect("GLN2 should be present in 1UBQ");
+
+        let (amide, geometry) =
+            perceive_backbone_amide(met1, gln2).expect("a real peptide bond joins MET1 and GLN2");
+
+        assert_eq!(
+            amide,
+            AmideGroup {
+                nitrogen_id: "N".to_string(),
+                carbon_id: "C".to_string(),
+                oxygen_id: "O".to_string(),
+                other_carbon_id: "CA".to_string(),
+            }
+        );
+        // Real midpoint of the real C-N bond, hand-computed from the real
+        // coordinates above.
+        let expected_center = (26.624, 27.2045, 3.3945);
+        assert!(
+            (geometry.center.0 - expected_center.0).abs() < 1e-3
+                && (geometry.center.1 - expected_center.1).abs() < 1e-3
+                && (geometry.center.2 - expected_center.2).abs() < 1e-3,
+            "expected center near {expected_center:?}, got {:?}",
+            geometry.center
+        );
+        // Real unit normal of the real C-O-N plane, hand-computed from the
+        // same real coordinates.
+        let expected_normal = (-0.6107, -0.1233, 0.7822);
+        assert!(
+            (geometry.normal.0 - expected_normal.0).abs() < 1e-3
+                && (geometry.normal.1 - expected_normal.1).abs() < 1e-3
+                && (geometry.normal.2 - expected_normal.2).abs() < 1e-3,
+            "expected normal near {expected_normal:?}, got {:?}",
+            geometry.normal
+        );
+    }
+
+    #[test]
+    fn two_real_non_bonded_residues_produce_no_backbone_amide() {
+        // MET1's real C paired with ILE3's real N (a real, but non-bonded,
+        // atom pair -- 4.04A apart, confirmed against real 1UBQ
+        // coordinates) -- the peptide-bond distance gate must reject this
+        // even though both atoms are real and both residue names resolve.
+        let (pdb, _errors) =
+            pdbtbx::open("../../tests/fixtures/structures/1UBQ.cif").expect("1UBQ should load");
+        let met1 = pdb
+            .residues()
+            .find(|r| r.id().0 == 1 && r.name() == Some("MET"))
+            .expect("MET1 should be present in 1UBQ");
+        let ile3 = pdb
+            .residues()
+            .find(|r| r.id().0 == 3 && r.name() == Some("ILE"))
+            .expect("ILE3 should be present in 1UBQ");
+
+        assert!(perceive_backbone_amide(met1, ile3).is_none());
+    }
+
+    #[test]
+    fn backbone_amide_perception_is_far_more_complete_than_the_oracles_own_sparse_detection() {
+        // Real pdbe-arpeggio's own amide detection (OpenBabel SMARTS over
+        // its own re-perceived bond graph) only found 3 of 1UBQ's 76 real
+        // residues when run directly (confirmed by actually running real
+        // `pdbe-arpeggio` -- see this module's doc comment and the plan
+        // this produced). This asserts the deliberate opposite: a reliable
+        // fixed-name perceiver finds a real backbone amide at essentially
+        // every real sequence-adjacent pair, missing only true chain
+        // breaks/disorder.
+        let (pdb, _errors) =
+            pdbtbx::open("../../tests/fixtures/structures/1UBQ.cif").expect("1UBQ should load");
+        let mut residues: Vec<_> = pdb
+            .residues()
+            .filter(|r| {
+                r.name()
+                    .is_some_and(|n| crate::config::STANDARD_AMINO_ACIDS.contains(&n))
+            })
+            .collect();
+        residues.sort_by_key(|r| r.id().0);
+
+        let found = residues
+            .windows(2)
+            .filter(|pair| pair[1].id().0 == pair[0].id().0 + 1)
+            .filter(|pair| perceive_backbone_amide(pair[0], pair[1]).is_some())
+            .count();
+
+        assert_eq!(
+            found, 75,
+            "1UBQ has 76 continuous residues (no real chain break), so all 75 \
+             sequence-adjacent pairs should carry a real backbone amide"
+        );
     }
 }
