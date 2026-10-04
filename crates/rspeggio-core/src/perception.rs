@@ -13,7 +13,7 @@
 // before it's passed to the export functions, whose signatures are
 // untouched. Without that call, unknown components still fail loudly.
 //
-// Four passes, each checked against real CCD entries in the tests below:
+// Five passes, each checked against real CCD entries in the tests below:
 //   1. Connectivity: two atoms in the same residue are bonded if
 //      0.4 A < d < summed covalent radii + 0.45 A -- Open Babel's own
 //      `ConnectTheDots` window, the rule real pdbe-arpeggio's bond graph
@@ -33,11 +33,25 @@
 //      5) demotes the longer C-N; a guanidinium carbon (three "double" C-N
 //      = 6) keeps one. Same idea as Open Babel's own valence-driven
 //      cleanup, reduced to the one rule these groups need.
-//   4. Implicit hydrogens: most X-ray structures deposit no hydrogens, but
+//   4. Aromaticity, in the CCD's own convention (the one every looked-up
+//      component already follows -- not Open Babel's, which also calls
+//      pyrimidinones like uracil aromatic). A 5- or 6-membered C/N/O/S
+//      ring is aromatic iff its mean bond ratio and its max out-of-plane
+//      deviation are under `config::AROMATIC_RING_MAX_MEAN_BOND_RATIO` /
+//      `AROMATIC_RING_MAX_PLANE_DEVIATION` (see their docs for the real
+//      calibration -- planarity alone can't separate aromatic from
+//      saturated rings, the mean bond ratio does) and no ring atom carries
+//      an exocyclic C=O/C=S. Each ring is judged on its own, matching the
+//      CCD's per-ring flags in fused systems (guanine: 5-ring yes, 6-ring
+//      no).
+//   5. Implicit hydrogens: most X-ray structures deposit no hydrogens, but
 //      typing decides donor status from H neighbours in the component's
 //      graph (a CCD entry lists every H whether or not it was deposited).
-//      Each C/N/O/S gets (standard valence - bond-order sum) hydrogens
-//      (C 4, N 3, O 2, S 2), added as atoms with no coordinates and named
+//      Each non-aromatic C/N/O/S gets (standard valence - bond-order sum)
+//      hydrogens (C 4, N 3, O 2, S 2); aromatic ring atoms use
+//      `aromatic_implicit_h`'s degree-based rule instead, since bond-order
+//      sums mean nothing around a ring. Hydrogens are added as atoms with
+//      no coordinates and named
 //      `<parent>_H<n>` so they can't collide with a real atom name.
 //      `features.rs` then places them analytically exactly as it does for
 //      a CCD hydrogen the structure didn't resolve. This is the role Open
@@ -46,13 +60,17 @@
 //   for a non-water `NON-POLYMER`); polymer type isn't recoverable from
 //   one residue's shape.
 //
-// Known limitations (deliberate v1 scope, also written up in README.md):
-//   - No aromaticity. Every atom and bond is non-aromatic, so a perceived
-//     component gets no rings: no plane-plane, atom-plane or group-plane
-//     contacts, never typed aromatic. Ring C-C bonds (~1.39 A) read as
-//     `Double`, so an unsubstituted aromatic CH carbon (two "double" ring
-//     bonds = valence 4, not over-valent) gets no implicit H and isn't a
-//     weak donor. Fixing that needs real Kekule/aromaticity perception.
+// Known limitations (also written up in README.md):
+//   - A planar conjugated ring with no exocyclic C=O/C=S is called
+//     aromatic even where the CCD disagrees -- FMN's central N5/N10 ring
+//     is the one real false positive found.
+//   - The mean-bond-ratio gap is narrow (aromatic <= 0.962, saturated >=
+//     0.991 across every real ring checked), so a strained or
+//     low-resolution ring near it can flip.
+//   - Only 5- and 6-membered rings are considered, and rings through a
+//     metal (e.g. HEM's Fe chelate rings) never are.
+//   - An imidazole with neither N substituted gets an H on both (the
+//     CCD's own histidine form); the real tautomer isn't decided.
 //   - Neutral valences only, no charge model: an amine reads as neutral
 //     (-NH2, three neighbours), so it's a donor and acceptor but not
 //     pos-ionisable, unlike a CCD entry drawn as -NH3+ (e.g. lysine's NZ).
@@ -159,6 +177,171 @@ fn repair_over_valent(elements: &[String], bonds: &mut [PerceivedBond]) {
     }
 }
 
+fn ratio_to_covalent_sum(element_1: &str, element_2: &str, distance: f64) -> Option<f64> {
+    Some(distance / (config::covalent_radius(element_1)? + config::covalent_radius(element_2)?))
+}
+
+// Aromatic rings, as ordered atom-index cycles. Candidates are the
+// smallest ring through each heavy-atom bond (`rings.rs`'s own BFS), 5-
+// or 6-membered, made only of C/N/O/S (which also drops metal chelate
+// rings like HEM's Fe-N-C-C-C-N). A candidate is aromatic iff its mean
+// bond ratio and planarity are under the `config` thresholds and no ring
+// atom carries an exocyclic C=O/C=S (raw distance, before repair) -- the
+// CCD's own convention, which calls pyrimidinones like uracil
+// non-aromatic.
+fn aromatic_rings(
+    residue: &Residue,
+    atoms: &[&Atom],
+    elements: &[String],
+    bonds: &[PerceivedBond],
+) -> Vec<Vec<usize>> {
+    let index: HashMap<&str, usize> = atoms
+        .iter()
+        .enumerate()
+        .map(|(i, a)| (a.name(), i))
+        .collect();
+    let is_heavy = |i: usize| elements[i] != "H";
+    let bond_between = |a: usize, b: usize| {
+        bonds
+            .iter()
+            .find(|bd| (bd.i == a && bd.j == b) || (bd.i == b && bd.j == a))
+    };
+
+    let mut adjacency: HashMap<&str, Vec<&str>> = HashMap::new();
+    for b in bonds.iter().filter(|b| is_heavy(b.i) && is_heavy(b.j)) {
+        adjacency
+            .entry(atoms[b.i].name())
+            .or_default()
+            .push(atoms[b.j].name());
+        adjacency
+            .entry(atoms[b.j].name())
+            .or_default()
+            .push(atoms[b.i].name());
+    }
+
+    let mut seen: Vec<Vec<usize>> = Vec::new();
+    let mut aromatic = Vec::new();
+    for b in bonds.iter().filter(|b| is_heavy(b.i) && is_heavy(b.j)) {
+        let Some(path) = crate::rings::shortest_path_excluding_direct_edge(
+            &adjacency,
+            atoms[b.i].name(),
+            atoms[b.j].name(),
+        ) else {
+            continue;
+        };
+        let ring: Vec<usize> = path.iter().map(|name| index[name]).collect();
+        if !(5..=6).contains(&ring.len())
+            || !ring
+                .iter()
+                .all(|&a| matches!(elements[a].as_str(), "C" | "N" | "O" | "S"))
+        {
+            continue;
+        }
+        let mut key = ring.clone();
+        key.sort_unstable();
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+
+        let ratios: Option<Vec<f64>> = (0..ring.len())
+            .map(|k| {
+                let (a, c) = (ring[k], ring[(k + 1) % ring.len()]);
+                let bond = bond_between(a, c)?;
+                ratio_to_covalent_sum(&elements[a], &elements[c], bond.distance)
+            })
+            .collect();
+        let Some(ratios) = ratios else {
+            continue;
+        };
+        let mean_ratio = ratios.iter().sum::<f64>() / ratios.len() as f64;
+        if mean_ratio >= config::AROMATIC_RING_MAX_MEAN_BOND_RATIO {
+            continue;
+        }
+
+        let ring_atoms = crate::rings::RingAtoms {
+            atom_ids: ring.iter().map(|&a| atoms[a].name().to_string()).collect(),
+        };
+        let Some(geometry) = crate::rings::ring_geometry(&ring_atoms, residue) else {
+            continue;
+        };
+        let max_deviation = ring
+            .iter()
+            .map(|&a| {
+                let p = atoms[a].pos();
+                let d = (
+                    p.0 - geometry.center.0,
+                    p.1 - geometry.center.1,
+                    p.2 - geometry.center.2,
+                );
+                (d.0 * geometry.normal.0 + d.1 * geometry.normal.1 + d.2 * geometry.normal.2).abs()
+            })
+            .fold(0.0, f64::max);
+        if max_deviation >= config::AROMATIC_RING_MAX_PLANE_DEVIATION {
+            continue;
+        }
+
+        let has_exocyclic_double_to_o_or_s = bonds.iter().any(|bd| {
+            let (inside, outside) = if ring.contains(&bd.i) && !ring.contains(&bd.j) {
+                (bd.i, bd.j)
+            } else if ring.contains(&bd.j) && !ring.contains(&bd.i) {
+                (bd.j, bd.i)
+            } else {
+                return false;
+            };
+            matches!(elements[outside].as_str(), "O" | "S")
+                && ratio_to_covalent_sum(&elements[inside], &elements[outside], bd.distance)
+                    .is_some_and(|r| r < config::BOND_ORDER_DOUBLE_RATIO)
+        });
+        if has_exocyclic_double_to_o_or_s {
+            continue;
+        }
+
+        aromatic.push(ring);
+    }
+    aromatic
+}
+
+// Implicit H count for an aromatic ring atom, where bond-order sums are
+// meaningless (perceived ring bonds are a mix of single/double): carbon
+// takes 3 sigma bonds; nitrogen takes 3 if pyrrole-type, 2 if
+// pyridine-type; O/S none. A 5-ring N with two ring bonds is pyrrole-type
+// unless that ring already has a lone-pair donor (a 3-connected N, or an
+// O/S) -- so indole's N gets one H, a purine's N7 none (N9 is
+// substituted), and both imidazole N get one (the CCD's own histidine
+// form; the user's call for an undetermined tautomer).
+fn aromatic_implicit_h(
+    atom: usize,
+    elements: &[String],
+    bonds: &[PerceivedBond],
+    rings: &[Vec<usize>],
+) -> u32 {
+    let degree = |a: usize| bonds.iter().filter(|b| b.i == a || b.j == a).count() as u32;
+    let target: u32 = match elements[atom].as_str() {
+        "C" => 3,
+        "N" => {
+            let pyrrole_type = degree(atom) == 2
+                && rings
+                    .iter()
+                    .filter(|r| r.len() == 5 && r.contains(&atom))
+                    .any(|r| {
+                        !r.iter().any(|&other| {
+                            other != atom
+                                && (matches!(elements[other].as_str(), "O" | "S")
+                                    || (elements[other] == "N" && degree(other) >= 3))
+                        })
+                    });
+            if pyrrole_type {
+                3
+            } else {
+                2
+            }
+        }
+        _ => 0,
+    };
+    target.saturating_sub(degree(atom))
+}
+
 // Builds a `CcdComponent` from `residue`'s real coordinates alone. Atoms
 // are deduped by name (first wins), so alternate-location copies of the
 // same atom don't become separate atoms bonded to each other. Atoms with
@@ -192,10 +375,29 @@ pub fn perceive_component(residue: &Residue) -> CcdComponent {
     }
     repair_over_valent(&elements, &mut bonds);
 
+    let rings = aromatic_rings(residue, &atoms, &elements, &bonds);
+    let aromatic_atom = |a: usize| rings.iter().any(|r| r.contains(&a));
+    let aromatic_bond = |b: &PerceivedBond| {
+        rings.iter().any(|r| {
+            (0..r.len()).any(|k| {
+                let (x, y) = (r[k], r[(k + 1) % r.len()]);
+                (b.i == x && b.j == y) || (b.i == y && b.j == x)
+            })
+        })
+    };
+
     let mut ccd_atoms: Vec<CcdAtom> = atoms
         .iter()
         .zip(&elements)
-        .map(|(atom, element)| CcdAtom::new(atom.name().to_string(), element.clone(), false, false))
+        .enumerate()
+        .map(|(a, (atom, element))| {
+            CcdAtom::new(
+                atom.name().to_string(),
+                element.clone(),
+                aromatic_atom(a),
+                false,
+            )
+        })
         .collect();
     let mut ccd_bonds: Vec<CcdBond> = bonds
         .iter()
@@ -204,16 +406,21 @@ pub fn perceive_component(residue: &Residue) -> CcdComponent {
                 atoms[b.i].name().to_string(),
                 atoms[b.j].name().to_string(),
                 b.order,
-                false,
+                aromatic_bond(b),
             )
         })
         .collect();
 
     for (a, atom) in atoms.iter().enumerate() {
-        let Some(valence) = standard_valence(&elements[a]) else {
-            continue;
+        let implicit = if aromatic_atom(a) {
+            aromatic_implicit_h(a, &elements, &bonds, &rings)
+        } else {
+            let Some(valence) = standard_valence(&elements[a]) else {
+                continue;
+            };
+            valence.saturating_sub(valence_sum(a, &bonds))
         };
-        for n in 1..=valence.saturating_sub(valence_sum(a, &bonds)) {
+        for n in 1..=implicit {
             let h_name = format!("{}_H{n}", atom.name());
             ccd_atoms.push(CcdAtom::new(h_name.clone(), "H".to_string(), false, false));
             ccd_bonds.push(CcdBond::new(
@@ -426,8 +633,10 @@ mod tests {
         // Every amino-acid type in 1CA2 (first instance of each), treated
         // as if unknown: perceived typing and H counts vs. the real CCD
         // entry, for side-chain atoms plus the carbonyl O (backbone N/C
-        // are polymer-link atoms, see the ALA test). 77 of 127 atoms
-        // match exactly; every mismatch is pinned here by cause.
+        // are polymer-link atoms, see the ALA test). 103 of 127 atoms
+        // match exactly -- including every HIS/PHE/TRP/TYR ring atom, on
+        // aromaticity and H count -- and every mismatch is pinned here by
+        // cause.
         let pdb = load("1CA2");
         let components = common_components();
 
@@ -440,16 +649,6 @@ mod tests {
             "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
         ] {
             expected.insert(format!("{res} O"));
-        }
-        // No aromaticity in v1: ring atoms lose AROMATIC, ring N-H lose
-        // donor status, some ring CH lose their implicit H.
-        for id in [
-            "HIS CG", "HIS ND1", "HIS CD2", "HIS CE1", "HIS NE2", "TRP CG", "TRP CD1", "TRP CD2",
-            "TRP NE1", "TRP CE2", "TRP CE3", "TRP CZ2", "TRP CZ3", "TRP CH2", "TYR CG", "TYR CD1",
-            "TYR CD2", "TYR CE1", "TYR CE2", "TYR CZ", "PHE CG", "PHE CD1", "PHE CD2", "PHE CE1",
-            "PHE CE2", "PHE CZ",
-        ] {
-            expected.insert(id.to_string());
         }
         // No charge model: neutral -NH2 (donor + acceptor), not -NH3+.
         expected.insert("LYS NZ".to_string());
@@ -610,6 +809,252 @@ mod tests {
                     vec!["proximal", "hbond", "polar"]
                 ),
             ]
+        );
+    }
+
+    fn load_path(path: &str) -> PDB {
+        let (pdb, _errors) = pdbtbx::open(path).unwrap_or_else(|_| panic!("{path} should load"));
+        pdb
+    }
+
+    fn load_ccd(path: &str) -> CcdComponent {
+        rspeggio_ccd::parser::load_ccd_component(path)
+            .unwrap_or_else(|| panic!("{path} should parse"))
+    }
+
+    // Aromatic rings as sorted atom-name sets, via the same
+    // `rings::perceive_rings` every downstream ring contact uses.
+    fn ring_set(component: &CcdComponent) -> BTreeSet<Vec<String>> {
+        crate::rings::perceive_rings(component)
+            .into_iter()
+            .map(|r| {
+                let mut ids = r.atom_ids;
+                ids.sort();
+                ids
+            })
+            .collect()
+    }
+
+    fn ring(ids: &[&str]) -> Vec<String> {
+        let mut v: Vec<String> = ids.iter().map(|s| s.to_string()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn every_real_amino_acid_ring_instance_matches_its_ccd_aromaticity() {
+        // Every PHE/TYR/TRP/HIS/PRO with a complete ring, across every
+        // protein structure fixture -- instance by instance, so real
+        // per-instance geometric noise is exercised, not one lucky copy.
+        let components = common_components();
+        let mut checked = 0;
+        for path in [
+            "../../tests/fixtures/structures/1UBQ.cif",
+            "../../tests/fixtures/structures/1CA2.cif",
+            "../../tests/fixtures/structures/1MBO.cif",
+            "../../tests/fixtures/structures/1FLV.cif",
+            "../../tests/fixtures/structures/4FXC.cif",
+            "../../tests/fixtures/structures/3G4W.cif",
+            "tests/fixtures/structures/5PTI.cif",
+        ] {
+            let pdb = load_path(path);
+            for residue in pdb.residues() {
+                let name = residue.name().unwrap_or_default();
+                if !["PHE", "TYR", "TRP", "HIS", "PRO"].contains(&name) {
+                    continue;
+                }
+                let present: Vec<&str> = residue.atoms().map(|a| a.name()).collect();
+                let ring_atoms: &[&str] = match name {
+                    "PRO" => &["N", "CA", "CB", "CG", "CD"],
+                    "HIS" => &["CG", "ND1", "CD2", "CE1", "NE2"],
+                    "TRP" => &["CG", "CD1", "CD2", "NE1", "CE2", "CE3", "CZ2", "CZ3", "CH2"],
+                    _ => &["CG", "CD1", "CD2", "CE1", "CE2", "CZ"],
+                };
+                if !ring_atoms.iter().all(|a| present.contains(a)) {
+                    continue;
+                }
+                checked += 1;
+                assert_eq!(
+                    ring_set(&perceive_component(residue)),
+                    ring_set(&components[name]),
+                    "{name}{} in {path}",
+                    residue.id().0
+                );
+            }
+        }
+        assert_eq!(checked, 165);
+    }
+
+    #[test]
+    fn dna_bases_match_their_ccd_aromaticity_typing_and_hydrogens() {
+        // 1BNA (the Dickerson dodecamer): every base's perceived rings
+        // match the CCD's -- adenine both rings, guanine only its 5-ring
+        // (its 6-ring has exocyclic C6=O), cytosine/thymine none (C2=O),
+        // deoxyribose never -- the CCD convention, which Open Babel's
+        // model would not reproduce for the pyrimidinones.
+        let pdb = load("1BNA");
+        let components = common_components();
+        let mut instances = 0;
+        for residue in pdb.residues() {
+            let name = residue.name().unwrap_or_default();
+            if !["DA", "DC", "DG", "DT"].contains(&name) {
+                continue;
+            }
+            instances += 1;
+            let perceived = ring_set(&perceive_component(residue));
+            assert_eq!(
+                perceived,
+                ring_set(&components[name]),
+                "{name}{}",
+                residue.id().0
+            );
+            let expected_rings = match name {
+                "DA" => 2,
+                "DG" => 1,
+                _ => 0,
+            };
+            assert_eq!(perceived.len(), expected_rings, "{name}");
+        }
+        assert_eq!(instances, 24);
+
+        // Per-atom typing and H counts, first instance of each base: every
+        // base atom matches the CCD (including the non-aromatic
+        // pyrimidinone rings, from the valence rules alone). The only
+        // mismatches are backbone polymer-link effects, both cases where
+        // the CCD's free-monomer form is the less accurate one: OP2 is
+        // drawn as a free acid (an H, so a donor) where the real
+        // phosphodiester is deprotonated, and DC1 is the chain's 5' end,
+        // whose O5' really is a terminal OH (perceived) rather than bonded
+        // to the free monomer's phosphate (CCD).
+        let mut seen = BTreeSet::new();
+        let mut mismatched = BTreeSet::new();
+        for residue in pdb.residues() {
+            let name = residue.name().unwrap_or_default();
+            if !["DA", "DC", "DG", "DT"].contains(&name) || !seen.insert(name) {
+                continue;
+            }
+            let real = &components[name];
+            let perceived = perceive_component(residue);
+            for structure_atom in residue.atoms() {
+                let id = structure_atom.name();
+                let Some(real_atom) = real.atoms().iter().find(|a| a.atom_id() == id) else {
+                    continue;
+                };
+                let same_type = type_atom(real_atom, real, PHYSIOLOGICAL_PH)
+                    == type_atom(atom(&perceived, id), &perceived, PHYSIOLOGICAL_PH);
+                if !same_type || h_count(real, id) != h_count(&perceived, id) {
+                    mismatched.insert(format!("{name} {id}"));
+                }
+            }
+        }
+        let expected: BTreeSet<String> = ["DA OP2", "DG OP2", "DT OP2", "DC O5'"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(mismatched, expected);
+    }
+
+    #[test]
+    fn a_real_chlorobenzene_ligand_ring_is_aromatic_as_in_its_ccd_entry() {
+        let pdb = load("3G4W");
+        let real = load_ccd("tests/fixtures/ccd/8CL.cif");
+        let perceived = perceive_component(first_residue(&pdb, "8CL"));
+        assert_eq!(ring_set(&perceived).len(), 1);
+        assert_eq!(ring_set(&perceived), ring_set(&real));
+    }
+
+    #[test]
+    fn all_four_real_heme_pyrroles_are_aromatic_unlike_the_ccds_two() {
+        // HEM's real CCD entry flags only pyrroles A and C (a known
+        // curation quirk -- all four are chemically equivalent, and real
+        // arpeggio treats them consistently). Perception from real 1MBO
+        // coordinates finds all four, and never a ring through the Fe (the
+        // distance rule does bond Fe-N; the C/N/O/S-only filter drops
+        // those chelate rings).
+        let pdb = load("1MBO");
+        let real = ring_set(&load_ccd("tests/fixtures/ccd/HEM.cif"));
+        let perceived = ring_set(&perceive_component(first_residue(&pdb, "HEM")));
+
+        assert_eq!(real.len(), 2);
+        assert!(real.is_subset(&perceived));
+        let extra: BTreeSet<Vec<String>> = perceived.difference(&real).cloned().collect();
+        assert_eq!(
+            extra,
+            BTreeSet::from([
+                ring(&["NB", "C1B", "C2B", "C3B", "C4B"]),
+                ring(&["ND", "C1D", "C2D", "C3D", "C4D"]),
+            ])
+        );
+        assert!(perceived.iter().all(|r| !r.contains(&"FE".to_string())));
+    }
+
+    #[test]
+    fn fmns_central_ring_is_a_known_false_positive() {
+        // 1FLV's real FMN against its real CCD entry: the benzo ring is
+        // aromatic in both, the pyrimidinedione (exocyclic C2=O2, C4=O4)
+        // in neither. The central N5/N10 ring is planar and conjugated
+        // with no exocyclic C=O, so the geometric rule calls it aromatic
+        // where the CCD doesn't -- the one false positive found, pinned.
+        let pdb = load("1FLV");
+        let real = ring_set(&load_ccd("tests/fixtures/ccd/FMN.cif"));
+        let perceived = ring_set(&perceive_component(first_residue(&pdb, "FMN")));
+
+        assert_eq!(
+            real,
+            BTreeSet::from([ring(&["C5A", "C6", "C7", "C8", "C9", "C9A"])])
+        );
+        let mut expected = real.clone();
+        expected.insert(ring(&["C10", "C4A", "C5A", "C9A", "N10", "N5"]));
+        assert_eq!(perceived, expected);
+    }
+
+    #[test]
+    fn perceived_heme_recovers_real_arpeggios_golden_ring_b_contact() {
+        // The only non-atom-atom entry in real pdbe-arpeggio's golden
+        // 1MBO output is VAL68 CG1 CARBONPI against HEM pyrrole B -- a ring
+        // HEM's CCD entry doesn't flag, so the CCD-backed path has always
+        // missed it (see `export.rs`'s module doc). With HEM perceived
+        // instead, it comes out identical to the golden entry, field for
+        // field.
+        let pdb = load("1MBO");
+        let mut components = common_components();
+        components.insert("OXY".to_string(), load_ccd("tests/fixtures/ccd/OXY.cif"));
+        let selection =
+            crate::selection::SelectionContext::from_specs(&pdb, &["RESNAME:HEM".to_string()])
+                .expect("HEM is in 1MBO");
+
+        let golden: Vec<serde_json::Value> = serde_json::from_str(
+            &std::fs::read_to_string("../../tests/fixtures/golden/1MBO.json")
+                .expect("golden 1MBO should exist"),
+        )
+        .expect("golden 1MBO should parse");
+        let golden_planes: Vec<&serde_json::Value> =
+            golden.iter().filter(|e| e["type"] != "atom-atom").collect();
+        assert_eq!(golden_planes.len(), 1);
+
+        let find = |components: &HashMap<String, CcdComponent>| {
+            crate::export::export_atom_plane_contacts(
+                &pdb,
+                components,
+                &selection,
+                PHYSIOLOGICAL_PH,
+            )
+            .into_iter()
+            .find(|e| e.bgn.auth_seq_id == 68 && e.bgn.auth_atom_id == "CG1")
+        };
+
+        let mut with_real_hem = components.clone();
+        with_real_hem.insert("HEM".to_string(), load_ccd("tests/fixtures/ccd/HEM.cif"));
+        assert!(
+            find(&with_real_hem).is_none(),
+            "the CCD-backed path misses it"
+        );
+
+        augment_with_geometric_fallback(&pdb, &mut components);
+        let entry = find(&components).expect("perceived HEM should find it");
+        assert_eq!(
+            serde_json::to_value(&entry).expect("should serialize"),
+            *golden_planes[0]
         );
     }
 }

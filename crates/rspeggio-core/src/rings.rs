@@ -122,7 +122,7 @@ fn aromatic_adjacency(component: &CcdComponent) -> HashMap<&str, Vec<&str>> {
 // single direct `start`-`goal` step (that's the bond being closed into a
 // ring, not part of the path around it). `None` if `goal` is unreachable
 // without it.
-fn shortest_path_excluding_direct_edge<'a>(
+pub(crate) fn shortest_path_excluding_direct_edge<'a>(
     adjacency: &HashMap<&'a str, Vec<&'a str>>,
     start: &'a str,
     goal: &'a str,

@@ -27,6 +27,17 @@ pub const VDW_COMP_FACTOR: f64 = 0.1;
 // and can't be separated by distance alone (see `perception.rs`).
 pub const BOND_ORDER_DOUBLE_RATIO: f64 = 0.94;
 
+// `perception.rs`'s aromatic-ring test, calibrated against real rings
+// compared to their real CCD flags (fixtures plus 1BNA): every aromatic
+// ring's mean bond ratio (length / summed covalent radii) is <= 0.962
+// (HEM pyrrole A is the tightest), every saturated ring's >= 0.991
+// (proline's flattest). Planarity alone can't separate them -- a real
+// proline ring can be 0.027 A out of plane, flatter than FMN's aromatic
+// benzo ring (0.100) -- so it's only a secondary guard against twisted
+// conjugated rings.
+pub const AROMATIC_RING_MAX_MEAN_BOND_RATIO: f64 = 0.975;
+pub const AROMATIC_RING_MAX_PLANE_DEVIATION: f64 = 0.15;
+
 // u16 bit shift to build the FeatureBits e.g. HBOND = 0000000000000001 + WEAK_HBOND = 0000000000000010
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
