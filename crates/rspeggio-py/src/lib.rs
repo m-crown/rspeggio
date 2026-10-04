@@ -19,7 +19,10 @@
 // `common_components()` bundled set every Rust-side test already uses,
 // plus caller-supplied extra CCD files for any hetero groups/ligands not
 // in it (decision 03: unknown components fail loudly, surfaced here as a
-// real Python exception rather than a silent gap).
+// real Python exception rather than a silent gap). `geometric_fallback`
+// opts out of that for anything still unknown after loading, via
+// `rspeggio_core::perception` (M10) -- off by default, so the fail-loudly
+// default is unchanged.
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -56,8 +59,9 @@ fn load_components(extra_ccd_paths: &[String]) -> PyResult<HashMap<String, CcdCo
 ///     extra_ccd_paths: paths to additional CCD component ``.cif`` files
 ///         for any hetero groups/ligands not already in the bundled
 ///         common set (the 20 standard amino acids, water, standard
-///         nucleotides, and a handful of common ions). Each file's own
-///         stem is used as its comp_id (e.g. ``"HEM.cif"`` -> ``"HEM"``).
+///         nucleotides, and a handful of common ions). Each file is keyed
+///         by its own real ``_chem_comp.id``, not its filename (RCSB's
+///         ``ZN_ideal.cif`` is ``"ZN"``).
 ///     selection: real pdbe-arpeggio selection strings, e.g.
 ///         ``["RESNAME:ZN"]`` or ``["/A/45/"]``. Omit (or pass ``None``)
 ///         for whole-structure mode, where every residue is treated as
@@ -66,6 +70,12 @@ fn load_components(extra_ccd_paths: &[String]) -> PyResult<HashMap<String, CcdCo
 ///         project has (free/side-chain carboxyl-group protonation --
 ///         see ``rspeggio_core::typing::type_atom``'s own doc). Defaults
 ///         to physiological pH (7.4), real pdbe-arpeggio's own default.
+///     geometric_fallback: if true, any residue whose comp_id still has no
+///         CCD component (bundled or supplied) gets its chemistry perceived
+///         from its own 3D coordinates instead of raising. Approximate --
+///         no aromaticity, no charge model; see the README's
+///         "Geometric-perception fallback" section for every limitation.
+///         Defaults to false.
 ///
 /// Returns:
 ///     A JSON string: a list of contact objects. Parse it with
@@ -73,22 +83,27 @@ fn load_components(extra_ccd_paths: &[String]) -> PyResult<HashMap<String, CcdCo
 ///
 /// Raises:
 ///     ValueError: the structure file couldn't be opened, a residue's
-///         comp_id has no matching CCD component (real or supplied), the
+///         comp_id has no matching CCD component (real or supplied) and
+///         ``geometric_fallback`` is false, the
 ///         selection matched no real atoms, or a selection string is
 ///         malformed.
 #[pyfunction]
-#[pyo3(signature = (structure_path, extra_ccd_paths=Vec::new(), selection=None, ph=rspeggio_core::typing::PHYSIOLOGICAL_PH))]
+#[pyo3(signature = (structure_path, extra_ccd_paths=Vec::new(), selection=None, ph=rspeggio_core::typing::PHYSIOLOGICAL_PH, geometric_fallback=false))]
 fn get_contacts(
     structure_path: String,
     extra_ccd_paths: Vec<String>,
     selection: Option<Vec<String>>,
     ph: f64,
+    geometric_fallback: bool,
 ) -> PyResult<String> {
     let (pdb, _errors) = pdbtbx::open(&structure_path).map_err(|errors| {
         PyValueError::new_err(format!("failed to open {structure_path:?}: {errors:?}"))
     })?;
 
-    let components = load_components(&extra_ccd_paths)?;
+    let mut components = load_components(&extra_ccd_paths)?;
+    if geometric_fallback {
+        rspeggio_core::perception::augment_with_geometric_fallback(&pdb, &mut components);
+    }
 
     let selection_context = match selection {
         Some(specs) => SelectionContext::from_specs(&pdb, &specs).map_err(PyValueError::new_err)?,

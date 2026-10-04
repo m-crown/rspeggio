@@ -176,6 +176,7 @@ impl ComponentType {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct CcdComponent {
     atoms: Vec<CcdAtom>,
     bonds: Vec<CcdBond>,

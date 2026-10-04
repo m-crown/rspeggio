@@ -17,6 +17,16 @@ pub enum DistanceCategory {
 // default `vdw_comp` parameter (`interactions.py:37`).
 pub const VDW_COMP_FACTOR: f64 = 0.1;
 
+// `perception.rs`'s geometric bond-order cutoff: a bonded pair closer than
+// this fraction of its summed covalent radii reads as `Double`, otherwise
+// `Single`. Calibrated against real 1UBQ bond lengths, not guessed: true
+// single bonds (CA-C, N-CA) sit at 0.972-1.028 of the summed radii, real
+// C=O double bonds at 0.846-0.913, and resonance-shortened amide C-N
+// single bonds at 0.871-0.925. 0.94 splits true-single from double-ish
+// with ~0.02 margin either side; double vs amide-single genuinely overlap
+// and can't be separated by distance alone (see `perception.rs`).
+pub const BOND_ORDER_DOUBLE_RATIO: f64 = 0.94;
+
 // u16 bit shift to build the FeatureBits e.g. HBOND = 0000000000000001 + WEAK_HBOND = 0000000000000010
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]

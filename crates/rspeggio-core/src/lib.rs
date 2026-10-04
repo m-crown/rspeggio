@@ -4,6 +4,7 @@ pub mod export;
 pub mod features;
 pub mod hydrogenate;
 pub mod join;
+pub mod perception;
 pub mod rings;
 pub mod selection;
 pub mod typing;
